@@ -1,5 +1,10 @@
-target
+.env
+.direnv/
+target/
 Cargo.lock
 examples/*.json
 examples/*.pem
-.direnv/
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+lcov.info

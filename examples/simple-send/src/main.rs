@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     let result = client.send(builder.build()?).await;
 
     if let Err(error) = result {
-        println!("An error occured: {:?}", error);
+        println!("An error occurred: {:?}", error);
     }
 
     Ok(())

@@ -8,7 +8,12 @@ use std::{
 };
 
 use http::uri::InvalidUri;
+use serde::{Deserialize, Serialize};
 use serde_json::error::Error as JsonError;
+
+/// Maximum `Retry-After` duration accepted (365 days) to prevent arithmetic
+/// overflows when callers add the returned `Duration` to an `Instant` or `SystemTime`.
+const MAX_RETRY_AFTER_SECS: u64 = 365 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorInfo {
@@ -49,7 +54,7 @@ pub enum WebPushError {
     EndpointNotValid(ErrorInfo),
     /// The URL specified is invalid and should not be used again
     EndpointNotFound(ErrorInfo),
-    /// Maximum allowed payload size is 3800 characters
+    /// Maximum allowed payload size is 3800 bytes
     PayloadTooLarge,
     /// Error in reading a file
     Io(IoError),
@@ -102,8 +107,12 @@ impl From<hyper::Error> for WebPushError {
 
 #[cfg(feature = "isahc-client")]
 impl From<isahc::Error> for WebPushError {
-    fn from(_: isahc::Error) -> Self {
-        Self::Unspecified
+    fn from(err: isahc::Error) -> Self {
+        if err.kind() == isahc::error::ErrorKind::Timeout {
+            Self::Io(IoError::new(std::io::ErrorKind::TimedOut, "push request timed out"))
+        } else {
+            Self::Unspecified
+        }
     }
 }
 
@@ -146,7 +155,7 @@ impl fmt::Display for WebPushError {
             WebPushError::Unauthorized(info) => write!(f, "unauthorized: {}", info),
             WebPushError::BadRequest(info) => write!(f, "bad request: {}", info),
             WebPushError::ServerError { info, .. } => write!(f, "server error: {}", info),
-            WebPushError::PayloadTooLarge => write!(f, "maximum payload size of 3070 characters exceeded"),
+            WebPushError::PayloadTooLarge => write!(f, "maximum payload size of 3800 bytes exceeded"),
             WebPushError::InvalidUri => write!(f, "invalid uri provided"),
             WebPushError::NotImplemented(info) => write!(f, "not implemented: {}", info),
             WebPushError::EndpointNotValid(info) => write!(f, "endpoint not valid: {}", info),
@@ -168,21 +177,69 @@ impl fmt::Display for WebPushError {
     }
 }
 
-pub struct RetryAfter;
-impl RetryAfter {
-    pub fn from_str(header_value: &str) -> Option<Duration> {
-        if let Ok(seconds) = header_value.parse::<u64>() {
-            Some(Duration::from_secs(seconds))
-        } else {
-            chrono::DateTime::parse_from_rfc2822(header_value)
-                .map(|date_time| {
-                    let systime: SystemTime = date_time.into();
+pub(crate) struct RetryAfter;
 
+impl RetryAfter {
+    pub(crate) fn from_str(header_value: &str) -> Option<Duration> {
+        let trimmed = header_value.trim();
+        let max_duration = Duration::from_secs(MAX_RETRY_AFTER_SECS);
+
+        if let Ok(seconds) = trimmed.parse::<u64>() {
+            Some(Duration::from_secs(seconds.min(MAX_RETRY_AFTER_SECS)))
+        } else {
+            httpdate::parse_http_date(trimmed)
+                .map(|systime| {
                     systime
                         .duration_since(SystemTime::now())
                         .unwrap_or_else(|_| Duration::new(0, 0))
+                        .min(max_duration)
                 })
                 .ok()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_after_parses_seconds_and_clamps() {
+        assert_eq!(RetryAfter::from_str("0"), Some(Duration::from_secs(0)));
+        assert_eq!(RetryAfter::from_str("120"), Some(Duration::from_secs(120)));
+        assert_eq!(RetryAfter::from_str("  42  "), Some(Duration::from_secs(42)));
+        assert_eq!(
+            RetryAfter::from_str(&u64::MAX.to_string()),
+            Some(Duration::from_secs(MAX_RETRY_AFTER_SECS))
+        );
+    }
+
+    #[test]
+    fn retry_after_parses_http_dates() {
+        // Past RFC 7231 IMF-fixdate clamps to zero.
+        assert_eq!(
+            RetryAfter::from_str("Wed, 21 Oct 2015 07:28:00 GMT"),
+            Some(Duration::from_secs(0))
+        );
+
+        // Future date returns positive duration bounded by MAX_RETRY_AFTER_SECS.
+        let future = SystemTime::now() + Duration::from_secs(600);
+        let formatted = httpdate::fmt_http_date(future);
+        let parsed = RetryAfter::from_str(&formatted).unwrap();
+        assert!(parsed <= Duration::from_secs(600));
+        assert!(parsed >= Duration::from_secs(595));
+
+        // Far-future date clamps to MAX_RETRY_AFTER_SECS.
+        assert_eq!(
+            RetryAfter::from_str("Fri, 31 Dec 9999 23:59:59 GMT"),
+            Some(Duration::from_secs(MAX_RETRY_AFTER_SECS))
+        );
+    }
+
+    #[test]
+    fn retry_after_rejects_invalid_values() {
+        for bad in ["", "-5", "not-a-date", "12.5", "99999999999999999999999999999"] {
+            assert_eq!(RetryAfter::from_str(bad), None, "expected None for {bad:?}");
         }
     }
 }

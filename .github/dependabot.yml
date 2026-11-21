@@ -1,0 +1,18 @@
+# Cargo version updates are disabled on purpose: sad-web-push 0.11.x is a drop-in
+# replacement for web-push 0.11.0, and bumping the requirement of a public
+# dependency can change the public API, wire formats, or MSRV. Dependency
+# updates are reviewed manually; Dependabot security alerts stay enabled.
+# Workflow actions are SHA-pinned; Dependabot bumps both the commit SHAs and `# vX` comments.
+# Dependabot reads this file only from the default branch, so `0.11.x` needs an entry here too.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    target-branch: "main"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    target-branch: "0.11.x"

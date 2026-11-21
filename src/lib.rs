@@ -1,14 +1,15 @@
 //! # Web Push
 //!
 //! A library for creating and sending push notifications to a web browser. For
-//! content payload encryption it uses [RFC8188](https://datatracker.ietf.org/doc/html/rfc8188).
+//! content payload encryption it uses [RFC8188](https://datatracker.ietf.org/doc/html/rfc8188)
+//! and [RFC8291](https://datatracker.ietf.org/doc/html/rfc8291) implemented in pure Rust.
 //! The client is asynchronous and can run on any executor. An optional [`hyper`](https://crates.io/crates/hyper) based client is
 //! available with the feature `hyper-client`.
 //!
 //! # Example
 //!
 //! ```no_run
-//! # use web_push::*;
+//! # use sad_web_push::*;
 //! # use std::fs::File;
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -25,7 +26,7 @@
 //!
 //! // Read signing material for payload.
 //! let file = File::open("private.pem").unwrap();
-//! let mut sig_builder = VapidSignatureBuilder::from_pem(file, &subscription_info)?.build()?;
+//! let sig_builder = VapidSignatureBuilder::from_pem(file, &subscription_info)?.build()?;
 //!
 //! // Now add payload and encrypt.
 //! let mut builder = WebPushMessageBuilder::new(&subscription_info);
@@ -43,24 +44,20 @@
 //! # }
 //! ```
 
-#[macro_use]
-extern crate log;
-#[macro_use]
-extern crate serde_derive;
-
 #[cfg(feature = "hyper-client")]
 pub use crate::clients::hyper_client::HyperWebPushClient;
 #[cfg(feature = "isahc-client")]
 pub use crate::clients::isahc_client::IsahcWebPushClient;
 pub use crate::{
     clients::{request_builder, WebPushClient},
-    error::WebPushError,
+    error::{ErrorInfo, WebPushError},
     http_ece::ContentEncoding,
     message::{SubscriptionInfo, SubscriptionKeys, Urgency, WebPushMessage, WebPushMessageBuilder, WebPushPayload},
     vapid::{builder::PartialVapidSignatureBuilder, VapidSignature, VapidSignatureBuilder},
 };
 
 mod clients;
+mod endpoint;
 mod error;
 mod http_ece;
 mod message;

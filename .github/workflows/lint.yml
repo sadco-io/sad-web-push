@@ -1,0 +1,180 @@
+name: lint
+
+on:
+  push:
+    branches: [main, 0.11.x]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo fmt --all -- --check --color=always
+      - run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check --color=always
+      - run: cargo fmt --manifest-path tests/check-rename/Cargo.toml -- --check --color=always
+      - run: cargo fmt --manifest-path examples/simple-send/Cargo.toml -- --check --color=always
+      - run: cargo clippy --no-default-features --all-targets --color=always -- -D warnings
+      - run: cargo clippy --all-targets --color=always -- -D warnings
+      - run: cargo clippy --no-default-features --features hyper-client --all-targets --color=always -- -D warnings
+      - run: cargo clippy --all-features --all-targets --color=always -- -D warnings
+      - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --color=always -- -D warnings
+      - run: cargo clippy --manifest-path tests/check-rename/Cargo.toml --all-targets --color=always -- -D warnings
+      - run: cargo clippy --manifest-path examples/simple-send/Cargo.toml --all-targets --color=always -- -D warnings
+
+  actionlint:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+      - run: '"$(go env GOPATH)/bin/actionlint" -color'
+
+  cargo-deny:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
+        with:
+          arguments: --all-features
+
+  cargo-deny-scheduled:
+    name: cargo-deny (scheduled)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
+        with:
+          arguments: --all-features
+
+  check-doc:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: nightly
+      - run: cargo +stable doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+      - run: cargo +nightly doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings --cfg docsrs"
+
+  semver:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      # Keep rust-toolchain and cargo-semver-checks pinned together:
+      # cargo-semver-checks only reads the rustdoc JSON formats it was built for.
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: 1.100.0
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-semver-checks@0.51.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Prepare renamed web-push 0.11.0 baseline
+        run: |
+          rm -rf /tmp/web-push-0.11.0-baseline
+          mkdir -p /tmp/web-push-0.11.0-baseline
+          git archive 8de73e2e | tar -x -C /tmp/web-push-0.11.0-baseline
+          sed -i 's/^name = "web-push"$/name = "sad-web-push"/' /tmp/web-push-0.11.0-baseline/Cargo.toml
+      - name: Check semver compatibility against web-push 0.11.0
+        run: |
+          cargo +1.100.0 semver-checks check-release \
+            --baseline-root /tmp/web-push-0.11.0-baseline \
+            --release-type minor --default-features
+          cargo +1.100.0 semver-checks check-release \
+            --baseline-root /tmp/web-push-0.11.0-baseline \
+            --release-type minor --only-explicit-features
+          cargo +1.100.0 semver-checks check-release \
+            --baseline-root /tmp/web-push-0.11.0-baseline \
+            --release-type minor --only-explicit-features --features hyper-client
+          cargo +1.100.0 semver-checks check-release \
+            --baseline-root /tmp/web-push-0.11.0-baseline \
+            --release-type minor --all-features
+
+  package:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Verify package file list and zero symlinks
+        run: |
+          files=$(cargo package --list)
+          for required in LICENSE NOTICE SECURITY.md CHANGELOG.md README.md src/lib.rs; do
+            echo "$files" | grep -qx "$required" || { echo "missing from package: $required"; exit 1; }
+          done
+          cargo package
+          test -z "$(find target/package -type l)"
+          rm -rf /tmp/pkg-verify
+          mkdir -p /tmp/pkg-verify
+          tar xzf target/package/sad-web-push-*.crate -C /tmp/pkg-verify
+          cargo check --manifest-path /tmp/pkg-verify/sad-web-push-*/Cargo.toml --all-features
+          rm -rf /tmp/pkg-verify
+
+  fuzz:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: nightly
+      # Build from source instead of taiki-e/install-action: its binstall fallback
+      # ships a musl cargo-fuzz, which targets musl and breaks the sanitizer build.
+      - run: cargo install --locked cargo-fuzz@0.13.2
+      - run: cargo fuzz run fuzz_vapid_pem -- -max_total_time=30
+        working-directory: fuzz
+      - run: cargo fuzz run fuzz_vapid_der -- -max_total_time=30
+        working-directory: fuzz
+      - run: cargo fuzz run fuzz_vapid_base64 -- -max_total_time=30
+        working-directory: fuzz
+      - run: cargo fuzz run fuzz_subscription_build -- -max_total_time=30
+        working-directory: fuzz
+      - run: cargo fuzz run fuzz_parse_response -- -max_total_time=30
+        working-directory: fuzz
+      - run: cargo fuzz run fuzz_retry_after -- -max_total_time=30
+        working-directory: fuzz
