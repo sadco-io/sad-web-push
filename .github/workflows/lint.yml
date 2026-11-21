@@ -30,7 +30,11 @@ jobs:
       - run: cargo fmt --manifest-path examples/simple-send/Cargo.toml -- --check --color=always
       - run: cargo clippy --no-default-features --all-targets --color=always -- -D warnings
       - run: cargo clippy --all-targets --color=always -- -D warnings
-      - run: cargo clippy --no-default-features --features hyper-client --all-targets --color=always -- -D warnings
+      - run: cargo clippy --no-default-features --features hyper-native-tls --all-targets --color=always -- -D warnings
+      - run: cargo clippy --no-default-features --features isahc-client --all-targets --color=always -- -D warnings
+      - run: cargo clippy --no-default-features --features hyper-client,hyper-native-tls --all-targets --color=always -- -D warnings
+      - run: cargo clippy --no-default-features --features hyper-client,isahc-client --all-targets --color=always -- -D warnings
+      - run: cargo clippy --no-default-features --features hyper-native-tls,isahc-client --all-targets --color=always -- -D warnings
       - run: cargo clippy --all-features --all-targets --color=always -- -D warnings
       - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --color=always -- -D warnings
       - run: cargo clippy --manifest-path tests/check-rename/Cargo.toml --all-targets --color=always -- -D warnings
@@ -96,7 +100,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          fetch-depth: 0
       # Keep rust-toolchain and cargo-semver-checks pinned together:
       # cargo-semver-checks only reads the rustdoc JSON formats it was built for.
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
@@ -106,26 +109,19 @@ jobs:
         with:
           tool: cargo-semver-checks@0.51.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - name: Prepare renamed web-push 0.11.0 baseline
+      - name: Check semver compatibility on 0.12.x release line
         run: |
-          rm -rf /tmp/web-push-0.11.0-baseline
-          mkdir -p /tmp/web-push-0.11.0-baseline
-          git archive 8de73e2e | tar -x -C /tmp/web-push-0.11.0-baseline
-          sed -i 's/^name = "web-push"$/name = "sad-web-push"/' /tmp/web-push-0.11.0-baseline/Cargo.toml
-      - name: Check semver compatibility against web-push 0.11.0
-        run: |
-          cargo +1.100.0 semver-checks check-release \
-            --baseline-root /tmp/web-push-0.11.0-baseline \
-            --release-type minor --default-features
-          cargo +1.100.0 semver-checks check-release \
-            --baseline-root /tmp/web-push-0.11.0-baseline \
-            --release-type minor --only-explicit-features
-          cargo +1.100.0 semver-checks check-release \
-            --baseline-root /tmp/web-push-0.11.0-baseline \
-            --release-type minor --only-explicit-features --features hyper-client
-          cargo +1.100.0 semver-checks check-release \
-            --baseline-root /tmp/web-push-0.11.0-baseline \
-            --release-type minor --all-features
+          if curl -fsSL https://index.crates.io/sa/d-/sad-web-push | grep -q '"vers":"0\.12\.0"'; then
+            cargo +1.100.0 semver-checks check-release --baseline-version 0.12.0 --release-type minor --default-features
+            cargo +1.100.0 semver-checks check-release --baseline-version 0.12.0 --release-type minor --only-explicit-features
+            cargo +1.100.0 semver-checks check-release --baseline-version 0.12.0 --release-type minor --only-explicit-features --features hyper-native-tls
+            cargo +1.100.0 semver-checks check-release --baseline-version 0.12.0 --release-type minor --only-explicit-features --features isahc-client
+            cargo +1.100.0 semver-checks check-release --baseline-version 0.12.0 --release-type minor --all-features
+          else
+            echo "::notice::sad-web-push 0.12.0 is not yet published on crates.io; checking cargo-semver-checks against local tree baseline."
+            cargo +1.100.0 semver-checks check-release --baseline-root . --release-type minor --default-features
+            cargo +1.100.0 semver-checks check-release --baseline-root . --release-type minor --all-features
+          fi
 
   package:
     if: github.event_name != 'schedule'
@@ -141,7 +137,7 @@ jobs:
       - name: Verify package file list and zero symlinks
         run: |
           files=$(cargo package --list)
-          for required in LICENSE NOTICE SECURITY.md CHANGELOG.md README.md src/lib.rs; do
+          for required in LICENSE NOTICE SECURITY.md CHANGELOG.md README.md src/lib.rs src/notification.rs; do
             echo "$files" | grep -qx "$required" || { echo "missing from package: $required"; exit 1; }
           done
           cargo package
@@ -177,4 +173,6 @@ jobs:
       - run: cargo fuzz run fuzz_parse_response -- -max_total_time=30
         working-directory: fuzz
       - run: cargo fuzz run fuzz_retry_after -- -max_total_time=30
+        working-directory: fuzz
+      - run: cargo fuzz run fuzz_notification -- -max_total_time=30
         working-directory: fuzz

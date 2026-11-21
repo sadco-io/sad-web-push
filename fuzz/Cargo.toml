@@ -9,7 +9,7 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
-http = "0.2"
+http = "1"
 libfuzzer-sys = "0.4"
 serde_json = "1"
 
@@ -48,4 +48,9 @@ doc = false
 [[bin]]
 name = "fuzz_retry_after"
 path = "fuzz_targets/fuzz_retry_after.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_notification"
+path = "fuzz_targets/fuzz_notification.rs"
 doc = false

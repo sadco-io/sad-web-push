@@ -24,7 +24,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo test --no-default-features --color=always -- --color=always
       - run: cargo test --color=always -- --color=always
-      - run: cargo test --no-default-features --features hyper-client --color=always -- --color=always
+      - run: cargo test --no-default-features --features hyper-native-tls --color=always -- --color=always
+      - run: cargo test --no-default-features --features isahc-client --color=always -- --color=always
       - run: cargo test --all-features --color=always -- --color=always
       - run: cargo check --manifest-path examples/simple-send/Cargo.toml --color=always
 
@@ -40,7 +41,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo check --lib --no-default-features
       - run: cargo check --lib
-      - run: cargo check --lib --no-default-features --features hyper-client
+      - run: cargo check --lib --no-default-features --features hyper-native-tls
+      - run: cargo check --lib --no-default-features --features isahc-client
       - run: cargo check --lib --all-features
 
   rust_versions:

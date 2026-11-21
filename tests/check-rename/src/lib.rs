@@ -1,10 +1,11 @@
-//! Smoke test verifying drop-in compatibility when renaming `sad-web-push` to `web-push`.
+//! Smoke test verifying renamed `web-push = { package = "sad-web-push" }` usage on `0.12.x`.
 
 pub use http::StatusCode;
 pub use web_push::{
-    request_builder, ContentEncoding, ErrorInfo, HyperWebPushClient, IsahcWebPushClient, PartialVapidSignatureBuilder,
-    SubscriptionInfo, SubscriptionKeys, Urgency, VapidSignature, VapidSignatureBuilder, WebPushClient, WebPushError,
-    WebPushMessage, WebPushMessageBuilder, WebPushPayload,
+    request_builder, ContentEncoding, ErrorInfo, HyperNativeTlsWebPushClient, HyperNativeTlsWebPushClientBuilder,
+    HyperWebPushClient, HyperWebPushClientBuilder, IsahcWebPushClient, IsahcWebPushClientBuilder, Notification,
+    NotificationAction, PartialVapidSignatureBuilder, SubscriptionInfo, SubscriptionKeys, Urgency, VapidSignature,
+    VapidSignatureBuilder, WebPushClient, WebPushError, WebPushMessage, WebPushMessageBuilder, WebPushPayload,
 };
 
 #[cfg(test)]
@@ -26,7 +27,7 @@ mod tests {
     }
 
     #[test]
-    fn drop_in_vapid_and_encrypted_message_build() {
+    fn renamed_vapid_notification_and_encrypted_message_build() {
         let sub = sample_subscription();
 
         let partial: PartialVapidSignatureBuilder = VapidSignatureBuilder::from_pem_no_sub(PRIVATE_PEM).unwrap();
@@ -45,26 +46,38 @@ mod tests {
         assert_eq!(sig_pem.auth_k, sig_der.auth_k);
         assert!(!sig_b64.auth_t.is_empty());
 
+        let mut notification: Notification<()> =
+            Notification::new("Hello".to_string(), "https://example.com/open".to_string());
+        notification.body = Some("Declarative push test".to_string());
+        notification.actions = Some(vec![NotificationAction {
+            title: "View".to_string(),
+            action: "view".to_string(),
+            navigate: "https://example.com/view".to_string(),
+            icon: None,
+        }]);
+        let declarative_bytes = notification.to_payload().unwrap();
+
         for encoding in [ContentEncoding::Aes128Gcm, ContentEncoding::AesGcm] {
             let mut builder = WebPushMessageBuilder::new(&sub);
             builder.set_ttl(3600);
             builder.set_urgency(Urgency::High);
             builder.set_topic("updates".to_string());
-            builder.set_payload(encoding, b"hello from renamed web-push");
+            builder.set_payload(encoding, &declarative_bytes);
             builder.set_vapid_signature(sig_pem.clone());
 
             let msg: WebPushMessage = builder.build().unwrap();
             let payload: &WebPushPayload = msg.payload.as_ref().unwrap();
             assert_eq!(payload.content_encoding, encoding);
+            assert_eq!(msg.vapid_signature.as_ref(), Some(&sig_pem));
 
             let req = request_builder::try_build_request::<Vec<u8>>(msg).unwrap();
             assert_eq!(req.headers().get("Content-Encoding").unwrap(), encoding.to_str());
-            assert!(req.headers().get("Authorization").is_some());
+            assert_eq!(req.headers().get_all("Authorization").iter().count(), 1);
         }
     }
 
     #[test]
-    fn drop_in_empty_payload_vapid_and_clients_compile() {
+    fn renamed_empty_payload_vapid_errors_and_clients_compile() {
         let sub = sample_subscription();
         let sig = VapidSignatureBuilder::from_base64(PRIVATE_BASE64, &sub)
             .unwrap()
@@ -73,15 +86,23 @@ mod tests {
 
         let mut builder = WebPushMessageBuilder::new(&sub);
         builder.set_vapid_signature(sig);
-        let req = request_builder::build_request::<Vec<u8>>(builder.build().unwrap());
-        assert!(req.headers().get("Authorization").is_some());
+        let msg = builder.build().unwrap();
+        assert!(msg.payload.is_none());
+        assert!(msg.vapid_signature.is_some());
+
+        let req = request_builder::build_request::<Vec<u8>>(msg);
+        assert_eq!(req.headers().get_all("Authorization").iter().count(), 1);
         assert_eq!(req.headers().get("Content-Length").unwrap(), "0");
 
-        let _isahc: IsahcWebPushClient = IsahcWebPushClient::with_timeout(Duration::from_secs(5)).unwrap();
-        let _hyper: HyperWebPushClient = HyperWebPushClient::with_timeout(Duration::from_secs(5));
+        let hyper_client: HyperWebPushClient = HyperWebPushClient::with_timeout(Duration::from_secs(5)).unwrap();
+        let native_tls_client: HyperNativeTlsWebPushClient =
+            HyperNativeTlsWebPushClient::with_timeout(Duration::from_secs(5)).unwrap();
+        let isahc_client: IsahcWebPushClient = IsahcWebPushClient::with_timeout(Duration::from_secs(5)).unwrap();
+
         fn assert_client<C: WebPushClient>(_: &C) {}
-        assert_client(&_isahc);
-        assert_client(&_hyper);
+        assert_client(&hyper_client);
+        assert_client(&native_tls_client);
+        assert_client(&isahc_client);
 
         let keys = SubscriptionKeys {
             p256dh: "pub".into(),
@@ -92,10 +113,11 @@ mod tests {
         let err = request_builder::parse_response(StatusCode::TOO_MANY_REQUESTS, Vec::new()).unwrap_err();
         assert!(matches!(
             err,
-            WebPushError::ServerError {
+            WebPushError::TooManyRequests {
                 info: ErrorInfo { code: 429, .. },
                 ..
             }
         ));
+        assert_eq!(WebPushError::Timeout.short_description(), "timeout");
     }
 }
