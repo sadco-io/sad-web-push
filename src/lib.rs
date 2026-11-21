@@ -53,6 +53,7 @@ pub use crate::{
     error::{ErrorInfo, WebPushError},
     http_ece::ContentEncoding,
     message::{SubscriptionInfo, SubscriptionKeys, Urgency, WebPushMessage, WebPushMessageBuilder, WebPushPayload},
+    notification::{Notification, NotificationAction},
     vapid::{builder::PartialVapidSignatureBuilder, VapidSignature, VapidSignatureBuilder},
 };
 
@@ -61,4 +62,5 @@ mod endpoint;
 mod error;
 mod http_ece;
 mod message;
+mod notification;
 mod vapid;
