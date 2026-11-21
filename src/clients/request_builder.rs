@@ -3,15 +3,84 @@
 
 use std::time::Duration;
 
+use ct_codecs::{Base64UrlSafeNoPadding, Encoder};
 use http::{
-    header::{HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE},
+    header::{HeaderValue, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE},
     Request, StatusCode,
 };
 
 use crate::{
     error::{ErrorInfo, RetryAfter, WebPushError},
+    http_ece::{vapid_authorization_header, ContentEncoding},
     message::WebPushMessage,
 };
+
+/// Splits `input` on `delimiter` bytes occurring outside RFC 7230 §3.2.6 quoted strings,
+/// respecting `\`-escaped characters inside `"..."`. Returns `Err(WebPushError::Unspecified)`
+/// if a quoted string is unclosed.
+fn split_outside_quotes(input: &str, delimiter: u8) -> Result<Vec<&str>, WebPushError> {
+    let bytes = input.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_quotes = false;
+            }
+        } else if b == b'"' {
+            in_quotes = true;
+        } else if b == delimiter {
+            parts.push(&input[start..i]);
+            start = i + 1;
+        }
+    }
+
+    if in_quotes {
+        return Err(WebPushError::Unspecified);
+    }
+
+    parts.push(&input[start..]);
+    Ok(parts)
+}
+
+/// Strips any `p256ecdsa` parameter (case-insensitive) from every semicolon-separated
+/// parameter list within each comma-separated element of a legacy `aesgcm` `Crypto-Key`
+/// header value (`draft-ietf-httpbis-encryption-encoding-03` §4), preserving RFC 7230
+/// quoted-string parameter values intact. Returns `Ok(None)` if no non-empty elements remain,
+/// or `Err(WebPushError::Unspecified)` if a quoted string is unclosed.
+fn strip_aesgcm_p256ecdsa(existing: &str) -> Result<Option<String>, WebPushError> {
+    let mut elements = Vec::new();
+    for elem in split_outside_quotes(existing, b',')? {
+        let params: Vec<&str> = split_outside_quotes(elem, b';')?
+            .into_iter()
+            .map(str::trim)
+            .filter(|part| {
+                !part.is_empty()
+                    && !part
+                        .split_once('=')
+                        .map_or(*part, |(k, _)| k)
+                        .trim()
+                        .eq_ignore_ascii_case("p256ecdsa")
+            })
+            .collect();
+        if !params.is_empty() {
+            elements.push(params.join("; "));
+        }
+    }
+
+    if elements.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(elements.join(", ")))
+    }
+}
 
 /// Fallibly builds the HTTP request to send to the push service.
 ///
@@ -21,6 +90,12 @@ use crate::{
 /// created via [`crate::WebPushMessageBuilder::build`] using signatures produced
 /// by [`crate::VapidSignatureBuilder::build`] are guaranteed to produce valid
 /// headers.
+///
+/// When [`WebPushMessage::vapid_signature`] is `Some`, it is authoritative: any
+/// stale `Authorization` entry in `payload.crypto_headers` is replaced, and for
+/// legacy [`ContentEncoding::AesGcm`] payloads any stale `p256ecdsa` parameters
+/// are stripped across all `Crypto-Key` header entries and list elements before
+/// emitting the matching `p256ecdsa` parameter exactly once.
 pub fn try_build_request<T>(message: WebPushMessage) -> Result<Request<T>, WebPushError>
 where
     T: From<Vec<u8>> + From<&'static str>,
@@ -39,11 +114,54 @@ where
     }
 
     if let Some(payload) = message.payload {
+        let mut emitted_p256ecdsa = false;
+        let encoded_vapid_k = match message.vapid_signature.as_ref() {
+            Some(vapid) if payload.content_encoding == ContentEncoding::AesGcm => Some(
+                Base64UrlSafeNoPadding::encode_to_string(&vapid.auth_k).map_err(|_| WebPushError::InvalidCryptoKeys)?,
+            ),
+            _ => None,
+        };
+
         for (k, v) in payload.crypto_headers.into_iter() {
+            if message.vapid_signature.is_some() && k.eq_ignore_ascii_case(AUTHORIZATION.as_str()) {
+                // `message.vapid_signature` is authoritative; skip any stale Authorization header.
+                continue;
+            }
+
+            if let Some(encoded_k) = encoded_vapid_k.as_deref() {
+                if k.eq_ignore_ascii_case("crypto-key") {
+                    if let Some(cleaned) = strip_aesgcm_p256ecdsa(&v)? {
+                        let value = if !emitted_p256ecdsa {
+                            emitted_p256ecdsa = true;
+                            format!("{cleaned}; p256ecdsa={encoded_k}")
+                        } else {
+                            cleaned
+                        };
+                        let header_val = HeaderValue::from_str(&value).map_err(|_| WebPushError::Unspecified)?;
+                        builder = builder.header(k, header_val);
+                    }
+                    continue;
+                }
+            }
+
             let mut header_val = HeaderValue::from_str(&v).map_err(|_| WebPushError::Unspecified)?;
-            if k.eq_ignore_ascii_case("authorization") {
+            if k.eq_ignore_ascii_case(AUTHORIZATION.as_str()) {
                 header_val.set_sensitive(true);
             }
+            builder = builder.header(k, header_val);
+        }
+
+        if let Some(vapid) = message.vapid_signature.as_ref() {
+            if let Some(encoded_k) = encoded_vapid_k.as_deref() {
+                if !emitted_p256ecdsa {
+                    let value = format!("p256ecdsa={encoded_k}");
+                    let header_val = HeaderValue::from_str(&value).map_err(|_| WebPushError::Unspecified)?;
+                    builder = builder.header("Crypto-Key", header_val);
+                }
+            }
+            let (k, v) = vapid_authorization_header(vapid)?;
+            let mut header_val = HeaderValue::from_str(&v).map_err(|_| WebPushError::Unspecified)?;
+            header_val.set_sensitive(true);
             builder = builder.header(k, header_val);
         }
 
@@ -60,6 +178,12 @@ where
                 .map_err(|_| WebPushError::Unspecified)
         }
     } else {
+        if let Some(vapid) = message.vapid_signature.as_ref() {
+            let (k, v) = vapid_authorization_header(vapid)?;
+            let mut header_val = HeaderValue::from_str(&v).map_err(|_| WebPushError::Unspecified)?;
+            header_val.set_sensitive(true);
+            builder = builder.header(k, header_val);
+        }
         builder = builder.header(CONTENT_LENGTH, "0");
         builder.body("".into()).map_err(|_| WebPushError::Unspecified)
     }
@@ -84,21 +208,21 @@ where
 /// # use sad_web_push::{SubscriptionInfo, WebPushMessageBuilder};
 /// # use sad_web_push::request_builder::build_request;
 /// let info = SubscriptionInfo::new(
-///  "https://updates.push.services.mozilla.com/wpush/v1/...",
-///  "BLMbF9ffKBiWQLCKvTHb6LO8Nb6dcUh6TItC455vu2kElga6PQvUmaFyCdykxY2nOSSL3yKgfbmFLRTUaGv4yV8",
-///  "xS03Fi5ErfTNH_l9WHE9Ig",
-///  );
+///     "https://updates.push.services.mozilla.com/wpush/v1/...",
+///     "BLMbF9ffKBiWQLCKvTHb6LO8Nb6dcUh6TItC455vu2kElga6PQvUmaFyCdykxY2nOSSL3yKgfbmFLRTUaGv4yV8",
+///     "xS03Fi5ErfTNH_l9WHE9Ig",
+/// );
 ///
-///  let builder = WebPushMessageBuilder::new(&info);
+/// let builder = WebPushMessageBuilder::new(&info);
 ///
-///  // Build the request for isahc
-///  # #[cfg(feature = "isahc-client")]
-///  let request = build_request::<isahc::Body>(builder.build().unwrap());
-///  // Send using a http client
+/// // Build an `http::Request<Vec<u8>>` (or any body type implementing
+/// // `From<Vec<u8>> + From<&'static str>`, e.g. `http_body_util::Full<bytes::Bytes>`).
+/// let request = build_request::<Vec<u8>>(builder.build().unwrap());
+/// # let _ = request;
 /// ```
 pub fn build_request<T>(message: WebPushMessage) -> Request<T>
 where
-    T: From<Vec<u8>> + From<&'static str>, //This bound can be reduced to a &[u8] instead of str if needed
+    T: From<Vec<u8>> + From<&'static str>,
 {
     try_build_request(message).expect("valid web push message headers and URI")
 }
@@ -128,7 +252,7 @@ pub fn parse_response(response_status: StatusCode, body: Vec<u8>) -> Result<(), 
         StatusCode::NOT_FOUND => Err(WebPushError::EndpointNotFound(info)),
         StatusCode::PAYLOAD_TOO_LARGE => Err(WebPushError::PayloadTooLarge),
         StatusCode::BAD_REQUEST => Err(WebPushError::BadRequest(info)),
-        StatusCode::TOO_MANY_REQUESTS => Err(WebPushError::ServerError {
+        StatusCode::TOO_MANY_REQUESTS => Err(WebPushError::TooManyRequests {
             retry_after: None,
             info,
         }),
@@ -142,17 +266,13 @@ pub fn parse_response(response_status: StatusCode, body: Vec<u8>) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "isahc-client")]
     use http::Uri;
 
     use crate::{
-        clients::request_builder::*, error::WebPushError, message::WebPushMessageBuilder, SubscriptionInfo,
-        VapidSignature, WebPushMessage,
+        clients::request_builder::*, error::WebPushError, http_ece::ContentEncoding, message::WebPushMessageBuilder,
+        SubscriptionInfo, Urgency, VapidSignature, WebPushMessage,
     };
-    #[cfg(feature = "isahc-client")]
-    use crate::{http_ece::ContentEncoding, Urgency};
 
-    #[cfg(feature = "isahc-client")]
     #[test]
     fn builds_a_correct_request_with_empty_payload() {
         let sub = serde_json::json!({"endpoint":"https://fcm.googleapis.com/fcm/send/synthetic-test-token-000000000000",
@@ -170,7 +290,7 @@ mod tests {
         builder.set_urgency(Urgency::VeryLow);
         builder.set_topic("some-topic".into());
 
-        let request = build_request::<isahc::Body>(builder.build().unwrap());
+        let request = build_request::<Vec<u8>>(builder.build().unwrap());
         let ttl = request.headers().get("TTL").unwrap().to_str().unwrap();
         let urgency = request.headers().get("Urgency").unwrap().to_str().unwrap();
         let topic = request.headers().get("Topic").unwrap().to_str().unwrap();
@@ -179,11 +299,10 @@ mod tests {
         assert_eq!("420", ttl);
         assert_eq!("very-low", urgency);
         assert_eq!("some-topic", topic);
-        assert_eq!(request.headers().get(CONTENT_LENGTH).unwrap(), "0");
         assert_eq!(expected_uri.host(), request.uri().host());
+        assert_eq!(request.headers().get(CONTENT_LENGTH).unwrap(), "0");
     }
 
-    #[cfg(feature = "isahc-client")]
     #[test]
     fn builds_a_correct_request_with_payload() {
         let sub = serde_json::json!({"endpoint":"https://fcm.googleapis.com/fcm/send/synthetic-test-token-000000000000",
@@ -199,7 +318,7 @@ mod tests {
 
         builder.set_payload(ContentEncoding::Aes128Gcm, "test".as_bytes());
 
-        let request = build_request::<isahc::Body>(builder.build().unwrap());
+        let request = build_request::<Vec<u8>>(builder.build().unwrap());
 
         let encoding = request.headers().get("Content-Encoding").unwrap().to_str().unwrap();
 
@@ -226,18 +345,278 @@ mod tests {
             auth_k: vec![4, 1, 2, 3],
         });
 
-        let request = try_build_request::<Vec<u8>>(builder.build().unwrap()).unwrap();
-        let auth = request.headers().get("Authorization").unwrap();
-        assert!(auth.is_sensitive(), "Authorization header must be marked sensitive");
+        let msg = builder.build().unwrap();
+        assert!(msg.payload.is_none());
+        assert!(msg.vapid_signature.is_some());
+
+        let request = try_build_request::<Vec<u8>>(msg).unwrap();
+        let auth_headers: Vec<_> = request.headers().get_all(AUTHORIZATION).iter().collect();
+        assert_eq!(auth_headers.len(), 1);
+        assert!(
+            auth_headers[0].is_sensitive(),
+            "Authorization header must be marked sensitive"
+        );
+        assert!(auth_headers[0]
+            .to_str()
+            .unwrap()
+            .starts_with("vapid t=jwt.token.value, k="));
         assert_eq!(request.headers().get(CONTENT_LENGTH).unwrap(), "0");
         assert!(request.headers().get(CONTENT_ENCODING).is_none());
         assert!(request.headers().get(CONTENT_TYPE).is_none());
         assert!(request.body().is_empty());
+    }
 
-        // Non-VAPID empty push also sets Content-Length: 0.
-        let empty_req = try_build_request::<Vec<u8>>(WebPushMessageBuilder::new(&info).build().unwrap()).unwrap();
-        assert_eq!(empty_req.headers().get(CONTENT_LENGTH).unwrap(), "0");
-        assert!(empty_req.body().is_empty());
+    #[test]
+    fn emits_single_authorization_header_and_respects_mutated_vapid_signature() {
+        let info = SubscriptionInfo::new(
+            "https://updates.push.services.mozilla.com/wpush/v2/token",
+            "BGa4N1PI79lboMR_YrwCiCsgp35DRvedt7opHcf0yM3iOBTSoQYqQLwWxAfRKE6tsDnReWmhsImkhDF_DBdkNSU",
+            "EvcWjEgzr4rbvhfi3yds0A",
+        );
+        let old_sig = VapidSignature {
+            auth_t: "old.jwt.token".into(),
+            auth_k: vec![4, 1, 2, 3],
+        };
+        let new_sig = VapidSignature {
+            auth_t: "fresh.jwt.token".into(),
+            auth_k: vec![4, 9, 8, 7],
+        };
+        let new_k_b64 = Base64UrlSafeNoPadding::encode_to_string(&new_sig.auth_k).unwrap();
+
+        // Case 1: payload + vapid via builder -> single sensitive Authorization header
+        let mut builder = WebPushMessageBuilder::new(&info);
+        builder.set_payload(ContentEncoding::Aes128Gcm, b"hello");
+        builder.set_vapid_signature(old_sig.clone());
+        let req = try_build_request::<Vec<u8>>(builder.build().unwrap()).unwrap();
+        assert_eq!(req.headers().get_all(AUTHORIZATION).iter().count(), 1);
+        assert!(req.headers().get(AUTHORIZATION).unwrap().is_sensitive());
+
+        // Case 2: mutating msg.vapid_signature post-build overrides stale Authorization on Aes128Gcm
+        let mut builder = WebPushMessageBuilder::new(&info);
+        builder.set_payload(ContentEncoding::Aes128Gcm, b"hello");
+        builder.set_vapid_signature(old_sig.clone());
+        let mut msg = builder.build().unwrap();
+        msg.vapid_signature = Some(new_sig.clone());
+        let req = try_build_request::<Vec<u8>>(msg).unwrap();
+        let auths: Vec<_> = req.headers().get_all(AUTHORIZATION).iter().collect();
+        assert_eq!(auths.len(), 1);
+        assert!(auths[0].is_sensitive());
+        assert_eq!(
+            auths[0].to_str().unwrap(),
+            format!("vapid t=fresh.jwt.token, k={new_k_b64}")
+        );
+
+        // Case 3: mutating msg.vapid_signature post-build on AesGcm updates both Authorization and Crypto-Key p256ecdsa
+        let mut builder = WebPushMessageBuilder::new(&info);
+        builder.set_payload(ContentEncoding::AesGcm, b"hello");
+        builder.set_vapid_signature(old_sig);
+        let mut msg = builder.build().unwrap();
+        msg.vapid_signature = Some(new_sig.clone());
+        let req = try_build_request::<Vec<u8>>(msg).unwrap();
+        let auths: Vec<_> = req.headers().get_all(AUTHORIZATION).iter().collect();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(
+            auths[0].to_str().unwrap(),
+            format!("vapid t=fresh.jwt.token, k={new_k_b64}")
+        );
+        let crypto_key = req.headers().get("Crypto-Key").unwrap().to_str().unwrap();
+        assert!(crypto_key.starts_with("dh="));
+        assert!(crypto_key.contains(&format!("; p256ecdsa={new_k_b64}")));
+        assert_eq!(crypto_key.matches("p256ecdsa=").count(), 1);
+
+        // Case 4: manually attaching msg.vapid_signature to an AesGcm message built without VAPID
+        let mut builder = WebPushMessageBuilder::new(&info);
+        builder.set_payload(ContentEncoding::AesGcm, b"hello");
+        let mut msg = builder.build().unwrap();
+        msg.vapid_signature = Some(new_sig);
+        let req = try_build_request::<Vec<u8>>(msg).unwrap();
+        let auths: Vec<_> = req.headers().get_all(AUTHORIZATION).iter().collect();
+        assert_eq!(auths.len(), 1);
+        assert!(auths[0].is_sensitive());
+        assert_eq!(
+            auths[0].to_str().unwrap(),
+            format!("vapid t=fresh.jwt.token, k={new_k_b64}")
+        );
+        let crypto_key = req.headers().get("Crypto-Key").unwrap().to_str().unwrap();
+        assert!(crypto_key.starts_with("dh="));
+        assert!(crypto_key.contains(&format!("; p256ecdsa={new_k_b64}")));
+    }
+
+    #[test]
+    fn aesgcm_crypto_key_rewrite_handles_comma_lists_and_multiple_headers() {
+        use crate::WebPushPayload;
+
+        let endpoint: Uri = "https://updates.push.services.mozilla.com/wpush/v2/token"
+            .parse()
+            .unwrap();
+        let new_sig = VapidSignature {
+            auth_t: "fresh.jwt.token".into(),
+            auth_k: vec![4, 9, 8, 7],
+        };
+        let new_k_b64 = Base64UrlSafeNoPadding::encode_to_string(&new_sig.auth_k).unwrap();
+
+        // Case 1: comma-separated list with standalone stale p256ecdsa element
+        let msg = WebPushMessage {
+            endpoint: endpoint.clone(),
+            ttl: 60,
+            urgency: None,
+            topic: None,
+            payload: Some(WebPushPayload {
+                content: vec![1, 2, 3],
+                crypto_headers: vec![
+                    ("Crypto-Key", "dh=abc, p256ecdsa=stale".into()),
+                    ("Encryption", "salt=xyz".into()),
+                ],
+                content_encoding: ContentEncoding::AesGcm,
+            }),
+            vapid_signature: Some(new_sig.clone()),
+        };
+        let req = try_build_request::<Vec<u8>>(msg).unwrap();
+        let ck_vals: Vec<&str> = req
+            .headers()
+            .get_all("Crypto-Key")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(ck_vals, vec![format!("dh=abc; p256ecdsa={new_k_b64}")]);
+
+        // Case 2: comma-separated list with semicolon-attached stale p256ecdsa and second record
+        let msg = WebPushMessage {
+            endpoint: endpoint.clone(),
+            ttl: 60,
+            urgency: None,
+            topic: None,
+            payload: Some(WebPushPayload {
+                content: vec![1, 2, 3],
+                crypto_headers: vec![
+                    ("Crypto-Key", "dh=abc;p256ecdsa=stale, keyid=1".into()),
+                    ("Encryption", "salt=xyz".into()),
+                ],
+                content_encoding: ContentEncoding::AesGcm,
+            }),
+            vapid_signature: Some(new_sig.clone()),
+        };
+        let req = try_build_request::<Vec<u8>>(msg).unwrap();
+        let ck_vals: Vec<&str> = req
+            .headers()
+            .get_all("Crypto-Key")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(ck_vals, vec![format!("dh=abc, keyid=1; p256ecdsa={new_k_b64}")]);
+        assert!(!ck_vals[0].contains("stale"));
+        assert_eq!(ck_vals[0].matches("p256ecdsa=").count(), 1);
+
+        // Case 3: multiple Crypto-Key headers (including p256ecdsa-only header and mixed-case key)
+        let msg = WebPushMessage {
+            endpoint: endpoint.clone(),
+            ttl: 60,
+            urgency: None,
+            topic: None,
+            payload: Some(WebPushPayload {
+                content: vec![1, 2, 3],
+                crypto_headers: vec![
+                    ("Crypto-Key", "p256ecdsa=stale0".into()),
+                    ("Crypto-Key", "dh=abc; P256ECDSA=stale1".into()),
+                    ("Crypto-Key", "keyid=1; p256ecdsa=stale2".into()),
+                    ("Encryption", "salt=xyz".into()),
+                ],
+                content_encoding: ContentEncoding::AesGcm,
+            }),
+            vapid_signature: Some(new_sig.clone()),
+        };
+        let req = try_build_request::<Vec<u8>>(msg).unwrap();
+        let ck_vals: Vec<&str> = req
+            .headers()
+            .get_all("Crypto-Key")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            ck_vals,
+            vec![format!("dh=abc; p256ecdsa={new_k_b64}"), "keyid=1".to_string()]
+        );
+        let joined = ck_vals.join(",");
+        assert!(!joined.contains("stale"));
+        assert_eq!(joined.matches("p256ecdsa=").count(), 1);
+
+        // Case 4: all existing Crypto-Key headers contained only p256ecdsa -> emits exactly one
+        let msg = WebPushMessage {
+            endpoint: endpoint.clone(),
+            ttl: 60,
+            urgency: None,
+            topic: None,
+            payload: Some(WebPushPayload {
+                content: vec![1, 2, 3],
+                crypto_headers: vec![
+                    ("Crypto-Key", "p256ecdsa=stale1".into()),
+                    ("Crypto-Key", "P256ECDSA=stale2".into()),
+                ],
+                content_encoding: ContentEncoding::AesGcm,
+            }),
+            vapid_signature: Some(new_sig.clone()),
+        };
+        let req = try_build_request::<Vec<u8>>(msg).unwrap();
+        let ck_vals: Vec<&str> = req
+            .headers()
+            .get_all("Crypto-Key")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(ck_vals, vec![format!("p256ecdsa={new_k_b64}")]);
+
+        // Case 5: quoted-string parameter values with commas, semicolons, and escaped quotes are preserved verbatim
+        let msg = WebPushMessage {
+            endpoint: endpoint.clone(),
+            ttl: 60,
+            urgency: None,
+            topic: None,
+            payload: Some(WebPushPayload {
+                content: vec![1, 2, 3],
+                crypto_headers: vec![
+                    (
+                        "Crypto-Key",
+                        r#"keyid="a,b"; p256ecdsa="stale;x", keyid="c\"d,e;f"; dh=abc"#.into(),
+                    ),
+                    ("Encryption", r#"keyid="a,b"; salt=xyz"#.into()),
+                ],
+                content_encoding: ContentEncoding::AesGcm,
+            }),
+            vapid_signature: Some(new_sig.clone()),
+        };
+        let req = try_build_request::<Vec<u8>>(msg).unwrap();
+        let ck_vals: Vec<&str> = req
+            .headers()
+            .get_all("Crypto-Key")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            ck_vals,
+            vec![format!(
+                r#"keyid="a,b", keyid="c\"d,e;f"; dh=abc; p256ecdsa={new_k_b64}"#
+            )]
+        );
+        assert!(!ck_vals[0].contains("stale"));
+        assert_eq!(ck_vals[0].matches("p256ecdsa=").count(), 1);
+
+        // Case 6: unclosed quoted-string fails closed instead of smuggling a stale p256ecdsa
+        let msg = WebPushMessage {
+            endpoint,
+            ttl: 60,
+            urgency: None,
+            topic: None,
+            payload: Some(WebPushPayload {
+                content: vec![1, 2, 3],
+                crypto_headers: vec![("Crypto-Key", r#"keyid="unclosed, p256ecdsa=stale"#.into())],
+                content_encoding: ContentEncoding::AesGcm,
+            }),
+            vapid_signature: Some(new_sig),
+        };
+        assert!(matches!(
+            try_build_request::<Vec<u8>>(msg),
+            Err(WebPushError::Unspecified)
+        ));
     }
 
     #[test]
@@ -250,6 +629,7 @@ mod tests {
             urgency: None,
             topic: Some("bad\r\ntopic".into()),
             payload: None,
+            vapid_signature: None,
         };
         assert!(try_build_request::<Vec<u8>>(msg).is_err());
     }
@@ -300,10 +680,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_a_too_many_requests_response_as_server_error() {
+    fn parses_a_too_many_requests_response_distinctly() {
         assert!(matches!(
             parse_response(StatusCode::TOO_MANY_REQUESTS, vec![]),
-            Err(WebPushError::ServerError { retry_after: None, .. })
+            Err(WebPushError::TooManyRequests { retry_after: None, .. })
         ));
     }
 

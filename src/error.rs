@@ -41,22 +41,31 @@ pub enum WebPushError {
     Unauthorized(ErrorInfo),
     /// Request was badly formed
     BadRequest(ErrorInfo),
-    /// Contains an optional `Duration`, until the user can retry the request
+    /// The push service returned HTTP 429 Too Many Requests.
+    /// Contains an optional `Duration` indicating when the request can be retried.
+    TooManyRequests {
+        retry_after: Option<Duration>,
+        info: ErrorInfo,
+    },
+    /// The push service returned a 5xx server error.
+    /// Contains an optional `Duration` indicating when the request can be retried.
     ServerError {
         retry_after: Option<Duration>,
         info: ErrorInfo,
     },
+    /// The push request or connection timed out.
+    Timeout,
     /// The feature is not implemented yet
     NotImplemented(ErrorInfo),
-    /// The provided URI is invalid
+    /// The provided URI is invalid or disallowed by endpoint security policy
     InvalidUri,
     /// The URL specified is no longer valid and should no longer be used
     EndpointNotValid(ErrorInfo),
     /// The URL specified is invalid and should not be used again
     EndpointNotFound(ErrorInfo),
-    /// Maximum allowed payload size is 3800 bytes
+    /// Maximum allowed payload size exceeded (3993 bytes for `aes128gcm`, 3800 bytes for `aesgcm`)
     PayloadTooLarge,
-    /// Error in reading a file
+    /// Error in reading a file or performing I/O
     Io(IoError),
     /// Make sure the message was addressed to a registration token whose
     /// package name matches the value passed in the request (Google).
@@ -98,9 +107,29 @@ impl From<InvalidUri> for WebPushError {
     }
 }
 
-#[cfg(feature = "hyper-client")]
+#[cfg(any(feature = "hyper-client", feature = "hyper-native-tls"))]
 impl From<hyper::Error> for WebPushError {
     fn from(_: hyper::Error) -> Self {
+        Self::Unspecified
+    }
+}
+
+#[cfg(any(feature = "hyper-client", feature = "hyper-native-tls"))]
+impl From<hyper_util::client::legacy::Error> for WebPushError {
+    fn from(err: hyper_util::client::legacy::Error) -> Self {
+        use crate::clients::safe_connector::SafeConnectError;
+
+        let mut source: Option<&(dyn Error + 'static)> = err.source();
+        while let Some(cur) = source {
+            if let Some(connect_err) = cur.downcast_ref::<SafeConnectError>() {
+                return match connect_err {
+                    SafeConnectError::DisallowedEndpoint => Self::InvalidUri,
+                    SafeConnectError::TimedOut => Self::Timeout,
+                    SafeConnectError::Io(_) => Self::Unspecified,
+                };
+            }
+            source = cur.source();
+        }
         Self::Unspecified
     }
 }
@@ -108,10 +137,9 @@ impl From<hyper::Error> for WebPushError {
 #[cfg(feature = "isahc-client")]
 impl From<isahc::Error> for WebPushError {
     fn from(err: isahc::Error) -> Self {
-        if err.kind() == isahc::error::ErrorKind::Timeout {
-            Self::Io(IoError::new(std::io::ErrorKind::TimedOut, "push request timed out"))
-        } else {
-            Self::Unspecified
+        match err.kind() {
+            isahc::error::ErrorKind::Timeout => Self::Timeout,
+            _ => Self::Unspecified,
         }
     }
 }
@@ -128,7 +156,9 @@ impl WebPushError {
             WebPushError::Unspecified => "unspecified",
             WebPushError::Unauthorized(_) => "unauthorized",
             WebPushError::BadRequest(_) => "bad_request",
+            WebPushError::TooManyRequests { .. } => "too_many_requests",
             WebPushError::ServerError { .. } => "server_error",
+            WebPushError::Timeout => "timeout",
             WebPushError::NotImplemented(_) => "not_implemented",
             WebPushError::InvalidUri => "invalid_uri",
             WebPushError::EndpointNotValid(_) => "endpoint_not_valid",
@@ -154,8 +184,15 @@ impl fmt::Display for WebPushError {
             WebPushError::Unspecified => write!(f, "unspecified error"),
             WebPushError::Unauthorized(info) => write!(f, "unauthorized: {}", info),
             WebPushError::BadRequest(info) => write!(f, "bad request: {}", info),
+            WebPushError::TooManyRequests { info, .. } => write!(f, "too many requests: {}", info),
             WebPushError::ServerError { info, .. } => write!(f, "server error: {}", info),
-            WebPushError::PayloadTooLarge => write!(f, "maximum payload size of 3800 bytes exceeded"),
+            WebPushError::Timeout => write!(f, "push request timed out"),
+            WebPushError::PayloadTooLarge => {
+                write!(
+                    f,
+                    "maximum payload size exceeded (3993 bytes for aes128gcm, 3800 bytes for aesgcm)"
+                )
+            }
             WebPushError::InvalidUri => write!(f, "invalid uri provided"),
             WebPushError::NotImplemented(info) => write!(f, "not implemented: {}", info),
             WebPushError::EndpointNotValid(info) => write!(f, "endpoint not valid: {}", info),
@@ -241,5 +278,25 @@ mod tests {
         for bad in ["", "-5", "not-a-date", "12.5", "99999999999999999999999999999"] {
             assert_eq!(RetryAfter::from_str(bad), None, "expected None for {bad:?}");
         }
+    }
+
+    #[test]
+    fn new_error_variants_have_expected_descriptions() {
+        let info = ErrorInfo {
+            code: 429,
+            errno: 999,
+            error: "rate_limited".into(),
+            message: "slow down".into(),
+        };
+        let tmr = WebPushError::TooManyRequests {
+            retry_after: Some(Duration::from_secs(30)),
+            info,
+        };
+        assert_eq!(tmr.short_description(), "too_many_requests");
+        assert!(tmr.to_string().contains("too many requests"));
+
+        let timeout = WebPushError::Timeout;
+        assert_eq!(timeout.short_description(), "timeout");
+        assert!(timeout.to_string().contains("timed out"));
     }
 }

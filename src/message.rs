@@ -8,7 +8,7 @@ use zeroize::Zeroizing;
 use crate::{
     endpoint::{redact_endpoint_str, redact_endpoint_uri, validate_endpoint},
     error::WebPushError,
-    http_ece::{vapid_authorization_header, ContentEncoding, HttpEce},
+    http_ece::{ContentEncoding, HttpEce},
     vapid::VapidSignature,
 };
 
@@ -144,9 +144,11 @@ pub struct WebPushMessage {
     pub urgency: Option<Urgency>,
     /// The topic of the message.
     pub topic: Option<String>,
-    /// The encrypted request payload, if sending any data (or VAPID-only headers
-    /// with an empty `content` vector when sending an authenticated empty push).
+    /// The encrypted request payload, if sending any data.
     pub payload: Option<WebPushPayload>,
+    /// Optional VAPID signature used to authenticate the push request, including
+    /// for empty-payload pushes.
+    pub vapid_signature: Option<VapidSignature>,
 }
 
 impl fmt::Debug for WebPushMessage {
@@ -157,6 +159,7 @@ impl fmt::Debug for WebPushMessage {
             .field("urgency", &self.urgency)
             .field("topic", &self.topic)
             .field("payload", &self.payload)
+            .field("vapid_signature", &self.vapid_signature)
             .finish()
     }
 }
@@ -250,8 +253,11 @@ impl<'a> WebPushMessageBuilder<'a> {
         self.vapid_signature = Some(vapid_signature);
     }
 
-    /// If set, the client will get content in the notification. Has a maximum size of
-    /// 3800 bytes.
+    /// If set, the client will get content in the notification.
+    ///
+    /// Has a maximum plaintext size of `3,993` bytes for [`ContentEncoding::Aes128Gcm`]
+    /// (producing a 4,096-byte encoded HTTP body per RFC 8291 §4) and `3,800` bytes for
+    /// legacy [`ContentEncoding::AesGcm`].
     ///
     /// `Aes128Gcm` is preferred, if the browser supports it.
     pub fn set_payload(&mut self, encoding: ContentEncoding, content: &'a [u8]) {
@@ -295,7 +301,7 @@ impl<'a> WebPushMessageBuilder<'a> {
                 return Err(WebPushError::InvalidCryptoKeys);
             }
 
-            let http_ece = HttpEce::new(payload.encoding, &p256dh, auth.as_ref(), self.vapid_signature);
+            let http_ece = HttpEce::new(payload.encoding, &p256dh, auth.as_ref(), self.vapid_signature.clone());
 
             Ok(WebPushMessage {
                 endpoint,
@@ -303,19 +309,7 @@ impl<'a> WebPushMessageBuilder<'a> {
                 urgency: self.urgency,
                 topic,
                 payload: Some(http_ece.encrypt(payload.content)?),
-            })
-        } else if let Some(vapid_signature) = self.vapid_signature {
-            let crypto_headers = vec![vapid_authorization_header(&vapid_signature)?];
-            Ok(WebPushMessage {
-                endpoint,
-                ttl: self.ttl,
-                urgency: self.urgency,
-                topic,
-                payload: Some(WebPushPayload {
-                    content: Vec::new(),
-                    crypto_headers,
-                    content_encoding: ContentEncoding::Aes128Gcm,
-                }),
+                vapid_signature: self.vapid_signature,
             })
         } else {
             Ok(WebPushMessage {
@@ -324,6 +318,7 @@ impl<'a> WebPushMessageBuilder<'a> {
                 urgency: self.urgency,
                 topic,
                 payload: None,
+                vapid_signature: self.vapid_signature,
             })
         }
     }
@@ -356,22 +351,16 @@ mod tests {
             "BLMbF9ffKBiWQLCKvTHb6LO8Nb6dcUh6TItC455vu2kElga6PQvUmaFyCdykxY2nOSSL3yKgfbmFLRTUaGv4yV8",
             "xS03Fi5ErfTNH_l9WHE9Ig",
         );
-        let mut builder = WebPushMessageBuilder::new(&info);
-        builder.set_vapid_signature(VapidSignature {
+        let sig = VapidSignature {
             auth_t: "header.payload.sig".into(),
             auth_k: vec![4, 1, 2, 3],
-        });
+        };
+        let mut builder = WebPushMessageBuilder::new(&info);
+        builder.set_vapid_signature(sig.clone());
 
         let message = builder.build().unwrap();
-        let payload = message
-            .payload
-            .expect("VAPID-only empty push must carry crypto_headers");
-        assert!(payload.content.is_empty());
-        assert_eq!(payload.crypto_headers.len(), 1);
-        assert_eq!(payload.crypto_headers[0].0, "Authorization");
-        assert!(payload.crypto_headers[0]
-            .1
-            .starts_with("vapid t=header.payload.sig, k="));
+        assert!(message.payload.is_none());
+        assert_eq!(message.vapid_signature, Some(sig));
     }
 
     #[test]
@@ -424,9 +413,11 @@ mod tests {
             assert!(!msg_dbg.contains(secret_jwt));
             assert!(msg_dbg.contains("[REDACTED]"));
 
-            let payload_dbg = format!("{:?}", msg.payload.as_ref().unwrap());
-            assert!(!payload_dbg.contains(secret_jwt));
-            assert!(payload_dbg.contains("[REDACTED]"));
+            if let Some(payload) = msg.payload.as_ref() {
+                let payload_dbg = format!("{payload:?}");
+                assert!(!payload_dbg.contains(secret_jwt));
+                assert!(payload_dbg.contains("[REDACTED]"));
+            }
         }
     }
 

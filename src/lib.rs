@@ -2,9 +2,14 @@
 //!
 //! A library for creating and sending push notifications to a web browser. For
 //! content payload encryption it uses [RFC8188](https://datatracker.ietf.org/doc/html/rfc8188)
-//! and [RFC8291](https://datatracker.ietf.org/doc/html/rfc8291) implemented in pure Rust.
-//! The client is asynchronous and can run on any executor. An optional [`hyper`](https://crates.io/crates/hyper) based client is
-//! available with the feature `hyper-client`.
+//! and [RFC8291](https://datatracker.ietf.org/doc/html/rfc8291) implemented in pure Rust,
+//! with pure-Rust ES256 VAPID authentication ([RFC8292](https://datatracker.ietf.org/doc/html/rfc8292))
+//! and W3C Declarative Web Push [`Notification`] payload builders.
+//!
+//! By default (`hyper-client`), `HyperWebPushClient` uses `hyper 1.x` with pure-Rust TLS
+//! (`hyper-rustls` + `ring`), OS root certificates, and a DNS-rebinding-safe connector with zero
+//! OpenSSL or libcurl dependencies. Optional `HyperNativeTlsWebPushClient` (`hyper-native-tls`)
+//! and `IsahcWebPushClient` (`isahc-client`) transports are also available.
 //!
 //! # Example
 //!
@@ -25,7 +30,7 @@
 //! );
 //!
 //! // Read signing material for payload.
-//! let file = File::open("private.pem").unwrap();
+//! let file = File::open("private.pem")?;
 //! let sig_builder = VapidSignatureBuilder::from_pem(file, &subscription_info)?.build()?;
 //!
 //! // Now add payload and encrypt.
@@ -34,20 +39,22 @@
 //! builder.set_payload(ContentEncoding::Aes128Gcm, content);
 //! builder.set_vapid_signature(sig_builder);
 //!
-//! # #[cfg(feature = "isahc-client")]
-//! let client = IsahcWebPushClient::new()?;
+//! # #[cfg(feature = "hyper-client")]
+//! let client = HyperWebPushClient::new()?;
 //!
 //! // Finally, send the notification!
-//! # #[cfg(feature = "isahc-client")]
+//! # #[cfg(feature = "hyper-client")]
 //! client.send(builder.build()?).await?;
 //! # Ok(())
 //! # }
 //! ```
 
 #[cfg(feature = "hyper-client")]
-pub use crate::clients::hyper_client::HyperWebPushClient;
+pub use crate::clients::hyper_client::{HyperWebPushClient, HyperWebPushClientBuilder};
+#[cfg(feature = "hyper-native-tls")]
+pub use crate::clients::hyper_native_tls_client::{HyperNativeTlsWebPushClient, HyperNativeTlsWebPushClientBuilder};
 #[cfg(feature = "isahc-client")]
-pub use crate::clients::isahc_client::IsahcWebPushClient;
+pub use crate::clients::isahc_client::{IsahcWebPushClient, IsahcWebPushClientBuilder};
 pub use crate::{
     clients::{request_builder, WebPushClient},
     error::{ErrorInfo, WebPushError},

@@ -211,6 +211,15 @@ fn is_shorthand_numeric_host(lower_host: &str) -> bool {
     false
 }
 
+/// Returns `true` if `ip` is permitted by the default endpoint IP policy.
+#[cfg(any(feature = "hyper-client", feature = "hyper-native-tls", test))]
+pub(crate) fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !is_disallowed_ipv4(v4),
+        IpAddr::V6(v6) => !is_disallowed_ipv6(v6),
+    }
+}
+
 fn is_disallowed_ipv4(ip: Ipv4Addr) -> bool {
     let [a, b, c, _] = ip.octets();
     // 0.0.0.0/8 ("this network" / unspecified)
@@ -540,5 +549,27 @@ mod tests {
             origin_for_vapid(&plus_port_uri),
             Err(WebPushError::InvalidUri)
         ));
+    }
+
+    #[test]
+    fn is_public_ip_matches_policy() {
+        for allowed in ["8.8.8.8", "2606:4700:4700::1111", "::ffff:8.8.8.8", "64:ff9b::8.8.8.8"] {
+            assert!(is_public_ip(allowed.parse().unwrap()), "expected public: {allowed}");
+        }
+        for blocked in [
+            "127.0.0.1",
+            "169.254.169.254",
+            "192.88.99.1",
+            "::1",
+            "2001::1",
+            "2002:7f00:0001::1",
+            "3fff::1",
+            "::ffff:0:127.0.0.1",
+            "0200::1",
+            "4000::1",
+            "64:ff9b:1::1",
+        ] {
+            assert!(!is_public_ip(blocked.parse().unwrap()), "expected blocked: {blocked}");
+        }
     }
 }

@@ -14,8 +14,15 @@ use zeroize::Zeroizing;
 
 use crate::{error::WebPushError, message::WebPushPayload, vapid::VapidSignature};
 
-/// Maximum unencrypted payload size accepted by push servers (in bytes).
-pub(crate) const MAX_PAYLOAD_SIZE: usize = 3800;
+/// Maximum unencrypted payload size for RFC 8291 `aes128gcm`, fitting within
+/// RFC 8291 §4's 4,096-byte total encrypted HTTP body limit (86-byte content-coding
+/// header + 3,993-byte plaintext + 1-byte final-record delimiter + 16-byte GCM
+/// authentication tag = 4,096 bytes; `rs = 4096`, encrypted record + tag = 4,010 bytes).
+pub(crate) const MAX_AES128GCM_PAYLOAD_SIZE: usize = 3993;
+
+/// Maximum unencrypted payload size for legacy `aesgcm` (kept conservative at 3,800 bytes
+/// so the 3,818-byte encrypted HTTP body remains well under 4,096 bytes).
+pub(crate) const MAX_AESGCM_PAYLOAD_SIZE: usize = 3800;
 
 const AES128GCM_RECORD_SIZE: u32 = 4096;
 const UNCOMPRESSED_PUBKEY_LEN: usize = 65;
@@ -41,6 +48,14 @@ impl ContentEncoding {
         match &self {
             ContentEncoding::Aes128Gcm => "aes128gcm",
             ContentEncoding::AesGcm => "aesgcm",
+        }
+    }
+
+    /// Returns the maximum unencrypted payload length in bytes supported by this encoding.
+    pub const fn max_payload_size(self) -> usize {
+        match self {
+            ContentEncoding::Aes128Gcm => MAX_AES128GCM_PAYLOAD_SIZE,
+            ContentEncoding::AesGcm => MAX_AESGCM_PAYLOAD_SIZE,
         }
     }
 }
@@ -82,11 +97,13 @@ impl<'a> HttpEce<'a> {
         }
     }
 
-    /// Encrypts a payload. The maximum length for the payload is 3800
-    /// bytes, which is the largest that works reliably with Google's and
-    /// Mozilla's push servers.
+    /// Encrypts a payload.
+    ///
+    /// The maximum plaintext length is `3,993` bytes for [`ContentEncoding::Aes128Gcm`]
+    /// (producing a 4,096-byte encoded HTTP body per RFC 8291 §4) and `3,800` bytes
+    /// for legacy [`ContentEncoding::AesGcm`].
     pub fn encrypt(&self, content: &'a [u8]) -> Result<WebPushPayload, WebPushError> {
-        if content.len() > MAX_PAYLOAD_SIZE {
+        if content.len() > self.encoding.max_payload_size() {
             return Err(WebPushError::PayloadTooLarge);
         }
 
@@ -324,8 +341,8 @@ mod tests {
     use crate::{
         error::WebPushError,
         http_ece::{
-            encrypt_aes128gcm_with_inputs, encrypt_aesgcm_with_inputs, ContentEncoding, HttpEce, MAX_PAYLOAD_SIZE,
-            UNCOMPRESSED_PUBKEY_LEN,
+            encrypt_aes128gcm_with_inputs, encrypt_aesgcm_with_inputs, ContentEncoding, HttpEce,
+            MAX_AES128GCM_PAYLOAD_SIZE, MAX_AESGCM_PAYLOAD_SIZE, UNCOMPRESSED_PUBKEY_LEN,
         },
         VapidSignature, WebPushPayload,
     };
@@ -430,18 +447,21 @@ mod tests {
         .unwrap();
         let auth = Base64UrlSafeNoPadding::decode_to_vec("xS03Fi5ErfTNH_l9WHE9Ig", None).unwrap();
 
-        let max_content = [b'a'; MAX_PAYLOAD_SIZE];
-        let oversized = [b'a'; MAX_PAYLOAD_SIZE + 1];
+        let aes128_ece = HttpEce::new(ContentEncoding::Aes128Gcm, &p256dh, &auth, None);
+        let aes128_max = aes128_ece.encrypt(&[b'a'; MAX_AES128GCM_PAYLOAD_SIZE]).unwrap();
+        assert_eq!(aes128_max.content.len(), 4096);
+        assert!(matches!(
+            aes128_ece.encrypt(&[b'a'; MAX_AES128GCM_PAYLOAD_SIZE + 1]),
+            Err(WebPushError::PayloadTooLarge)
+        ));
 
-        for encoding in [ContentEncoding::Aes128Gcm, ContentEncoding::AesGcm] {
-            let http_ece = HttpEce::new(encoding, &p256dh, &auth, None);
-            let encrypted = http_ece.encrypt(&max_content).unwrap();
-            assert!(encrypted.content.len() <= 4096);
-            assert!(matches!(
-                http_ece.encrypt(&oversized),
-                Err(WebPushError::PayloadTooLarge)
-            ));
-        }
+        let aesgcm_ece = HttpEce::new(ContentEncoding::AesGcm, &p256dh, &auth, None);
+        let aesgcm_max = aesgcm_ece.encrypt(&[b'a'; MAX_AESGCM_PAYLOAD_SIZE]).unwrap();
+        assert_eq!(aesgcm_max.content.len(), 3818);
+        assert!(matches!(
+            aesgcm_ece.encrypt(&[b'a'; MAX_AESGCM_PAYLOAD_SIZE + 1]),
+            Err(WebPushError::PayloadTooLarge)
+        ));
     }
 
     /// Verifies RFC 8291 Appendix A official test vector byte-for-byte.
@@ -502,7 +522,7 @@ mod tests {
         let auth = [0x42u8; 16];
 
         let http_ece = HttpEce::new(ContentEncoding::Aes128Gcm, ua_point.as_bytes(), &auth, None);
-        for plaintext in [&b""[..], b"Hello world!", &[b'x'; MAX_PAYLOAD_SIZE]] {
+        for plaintext in [&b""[..], b"Hello world!", &[b'x'; MAX_AES128GCM_PAYLOAD_SIZE]] {
             let ciphertext = http_ece.encrypt(plaintext).unwrap();
             assert!(ciphertext.content.len() >= 103);
             assert_ne!(plaintext, ciphertext.content.as_slice());
