@@ -1,42 +1,29 @@
 //! Functions used to send and consume push http messages.
 //! This module can be used to build custom clients.
 
+use std::time::Duration;
+
 use http::{
-    header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE},
+    header::{HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE},
     Request, StatusCode,
 };
 
 use crate::{
-    error::{ErrorInfo, WebPushError},
+    error::{ErrorInfo, RetryAfter, WebPushError},
     message::WebPushMessage,
 };
 
-/// Builds the request to send to the push service.
+/// Fallibly builds the HTTP request to send to the push service.
 ///
-/// This function is generic over the request body, this means that you can swap out client implementations
-/// even if they use different body types.
-///
-/// # Example
-///
-/// ```no_run
-/// # use web_push::{SubscriptionInfo, WebPushMessageBuilder};
-/// # use web_push::request_builder::build_request;
-/// let info = SubscriptionInfo::new(
-///  "http://google.com",
-///  "BLMbF9ffKBiWQLCKvTHb6LO8Nb6dcUh6TItC455vu2kElga6PQvUmaFyCdykxY2nOSSL3yKgfbmFLRTUaGv4yV8",
-///  "xS03Fi5ErfTNH_l9WHE9Ig",
-///  );
-///
-///  let mut builder = WebPushMessageBuilder::new(&info);
-///
-///  // Build the request for isahc
-///  # #[cfg(feature = "isahc-client")]
-///  let request = build_request::<isahc::Body>(builder.build().unwrap());
-///  // Send using a http client
-/// ```
-pub fn build_request<T>(message: WebPushMessage) -> Request<T>
+/// Unlike [`build_request`], this function returns an error instead of panicking
+/// if a manually constructed [`WebPushMessage`] (or a manually constructed
+/// [`crate::VapidSignature`]) contains invalid HTTP header values. Messages
+/// created via [`crate::WebPushMessageBuilder::build`] using signatures produced
+/// by [`crate::VapidSignatureBuilder::build`] are guaranteed to produce valid
+/// headers.
+pub fn try_build_request<T>(message: WebPushMessage) -> Result<Request<T>, WebPushError>
 where
-    T: From<Vec<u8>> + From<&'static str>, //This bound can be reduced to a &[u8] instead of str if needed
+    T: From<Vec<u8>> + From<&'static str>,
 {
     let mut builder = Request::builder()
         .method("POST")
@@ -52,20 +39,74 @@ where
     }
 
     if let Some(payload) = message.payload {
-        builder = builder
-            .header(CONTENT_ENCODING, payload.content_encoding.to_str())
-            .header(CONTENT_LENGTH, format!("{}", payload.content.len() as u64).as_bytes())
-            .header(CONTENT_TYPE, "application/octet-stream");
-
         for (k, v) in payload.crypto_headers.into_iter() {
-            let v: &str = v.as_ref();
-            builder = builder.header(k, v);
+            let mut header_val = HeaderValue::from_str(&v).map_err(|_| WebPushError::Unspecified)?;
+            if k.eq_ignore_ascii_case("authorization") {
+                header_val.set_sensitive(true);
+            }
+            builder = builder.header(k, header_val);
         }
 
-        builder.body(payload.content.into()).unwrap()
+        if payload.content.is_empty() {
+            builder = builder.header(CONTENT_LENGTH, "0");
+            builder.body("".into()).map_err(|_| WebPushError::Unspecified)
+        } else {
+            builder = builder
+                .header(CONTENT_ENCODING, payload.content_encoding.to_str())
+                .header(CONTENT_LENGTH, format!("{}", payload.content.len() as u64).as_bytes())
+                .header(CONTENT_TYPE, "application/octet-stream");
+            builder
+                .body(payload.content.into())
+                .map_err(|_| WebPushError::Unspecified)
+        }
     } else {
-        builder.body("".into()).unwrap()
+        builder = builder.header(CONTENT_LENGTH, "0");
+        builder.body("".into()).map_err(|_| WebPushError::Unspecified)
     }
+}
+
+/// Builds the request to send to the push service.
+///
+/// This function is generic over the request body, this means that you can swap out client implementations
+/// even if they use different body types.
+///
+/// # Panics
+///
+/// Panics if a hand-constructed [`WebPushMessage`] (or a manually constructed
+/// [`crate::VapidSignature`]) contains invalid HTTP header values. Messages
+/// constructed via [`crate::WebPushMessageBuilder::build`] with signatures
+/// produced by [`crate::VapidSignatureBuilder::build`] will not panic here;
+/// use [`try_build_request`] for a fallible alternative.
+///
+/// # Example
+///
+/// ```no_run
+/// # use sad_web_push::{SubscriptionInfo, WebPushMessageBuilder};
+/// # use sad_web_push::request_builder::build_request;
+/// let info = SubscriptionInfo::new(
+///  "https://updates.push.services.mozilla.com/wpush/v1/...",
+///  "BLMbF9ffKBiWQLCKvTHb6LO8Nb6dcUh6TItC455vu2kElga6PQvUmaFyCdykxY2nOSSL3yKgfbmFLRTUaGv4yV8",
+///  "xS03Fi5ErfTNH_l9WHE9Ig",
+///  );
+///
+///  let builder = WebPushMessageBuilder::new(&info);
+///
+///  // Build the request for isahc
+///  # #[cfg(feature = "isahc-client")]
+///  let request = build_request::<isahc::Body>(builder.build().unwrap());
+///  // Send using a http client
+/// ```
+pub fn build_request<T>(message: WebPushMessage) -> Request<T>
+where
+    T: From<Vec<u8>> + From<&'static str>, //This bound can be reduced to a &[u8] instead of str if needed
+{
+    try_build_request(message).expect("valid web push message headers and URI")
+}
+
+/// Parses an HTTP `Retry-After` header value (numeric seconds or RFC 7231 HTTP-date)
+/// into a bounded [`Duration`].
+pub fn parse_retry_after(header_value: &str) -> Option<Duration> {
+    RetryAfter::from_str(header_value)
 }
 
 /// Parses the response from the push service, and will return `Err` if the request was bad.
@@ -87,6 +128,10 @@ pub fn parse_response(response_status: StatusCode, body: Vec<u8>) -> Result<(), 
         StatusCode::NOT_FOUND => Err(WebPushError::EndpointNotFound(info)),
         StatusCode::PAYLOAD_TOO_LARGE => Err(WebPushError::PayloadTooLarge),
         StatusCode::BAD_REQUEST => Err(WebPushError::BadRequest(info)),
+        StatusCode::TOO_MANY_REQUESTS => Err(WebPushError::ServerError {
+            retry_after: None,
+            info,
+        }),
         status if status.is_server_error() => Err(WebPushError::ServerError {
             retry_after: None,
             info,
@@ -97,18 +142,20 @@ pub fn parse_response(response_status: StatusCode, body: Vec<u8>) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "isahc-client")]
     use http::Uri;
 
     use crate::{
-        clients::request_builder::*, error::WebPushError, http_ece::ContentEncoding, message::WebPushMessageBuilder,
-        Urgency,
+        clients::request_builder::*, error::WebPushError, message::WebPushMessageBuilder, SubscriptionInfo,
+        VapidSignature, WebPushMessage,
     };
+    #[cfg(feature = "isahc-client")]
+    use crate::{http_ece::ContentEncoding, Urgency};
 
     #[cfg(feature = "isahc-client")]
     #[test]
     fn builds_a_correct_request_with_empty_payload() {
-        //This *was* a real token
-        let sub = serde_json::json!({"endpoint":"https://fcm.googleapis.com/fcm/send/eKClHsXFm9E:APA91bH2x3gNOMv4dF1lQfCgIfOet8EngqKCAUS5DncLOd5hzfSUxcjigIjw9ws-bqa-KmohqiTOcgepAIVO03N39dQfkEkopubML_m3fyvF03pV9_JCB7SxpUjcFmBSVhCaWS6m8l7x",
+        let sub = serde_json::json!({"endpoint":"https://fcm.googleapis.com/fcm/send/synthetic-test-token-000000000000",
             "expirationTime":null,
             "keys":{"p256dh":
                 "BGa4N1PI79lboMR_YrwCiCsgp35DRvedt7opHcf0yM3iOBTSoQYqQLwWxAfRKE6tsDnReWmhsImkhDF_DBdkNSU",
@@ -132,14 +179,14 @@ mod tests {
         assert_eq!("420", ttl);
         assert_eq!("very-low", urgency);
         assert_eq!("some-topic", topic);
+        assert_eq!(request.headers().get(CONTENT_LENGTH).unwrap(), "0");
         assert_eq!(expected_uri.host(), request.uri().host());
     }
 
     #[cfg(feature = "isahc-client")]
     #[test]
     fn builds_a_correct_request_with_payload() {
-        //This *was* a real token
-        let sub = serde_json::json!({"endpoint":"https://fcm.googleapis.com/fcm/send/eKClHsXFm9E:APA91bH2x3gNOMv4dF1lQfCgIfOet8EngqKCAUS5DncLOd5hzfSUxcjigIjw9ws-bqa-KmohqiTOcgepAIVO03N39dQfkEkopubML_m3fyvF03pV9_JCB7SxpUjcFmBSVhCaWS6m8l7x",
+        let sub = serde_json::json!({"endpoint":"https://fcm.googleapis.com/fcm/send/synthetic-test-token-000000000000",
             "expirationTime":null,
             "keys":{"p256dh":
                 "BGa4N1PI79lboMR_YrwCiCsgp35DRvedt7opHcf0yM3iOBTSoQYqQLwWxAfRKE6tsDnReWmhsImkhDF_DBdkNSU",
@@ -159,9 +206,52 @@ mod tests {
         let length = request.headers().get("Content-Length").unwrap();
         let expected_uri: Uri = "fcm.googleapis.com".parse().unwrap();
 
-        assert_eq!("230", length);
+        // 86-byte aes128gcm header + 4-byte plaintext + 1-byte delimiter + 16-byte GCM tag = 107 bytes
+        assert_eq!("107", length);
         assert_eq!("aes128gcm", encoding);
         assert_eq!(expected_uri.host(), request.uri().host());
+    }
+
+    #[test]
+    fn builds_empty_payload_request_with_vapid_headers() {
+        let info = SubscriptionInfo::new(
+            "https://updates.push.services.mozilla.com/wpush/v2/token",
+            "BGa4N1PI79lboMR_YrwCiCsgp35DRvedt7opHcf0yM3iOBTSoQYqQLwWxAfRKE6tsDnReWmhsImkhDF_DBdkNSU",
+            "EvcWjEgzr4rbvhfi3yds0A",
+        );
+
+        let mut builder = WebPushMessageBuilder::new(&info);
+        builder.set_vapid_signature(VapidSignature {
+            auth_t: "jwt.token.value".into(),
+            auth_k: vec![4, 1, 2, 3],
+        });
+
+        let request = try_build_request::<Vec<u8>>(builder.build().unwrap()).unwrap();
+        let auth = request.headers().get("Authorization").unwrap();
+        assert!(auth.is_sensitive(), "Authorization header must be marked sensitive");
+        assert_eq!(request.headers().get(CONTENT_LENGTH).unwrap(), "0");
+        assert!(request.headers().get(CONTENT_ENCODING).is_none());
+        assert!(request.headers().get(CONTENT_TYPE).is_none());
+        assert!(request.body().is_empty());
+
+        // Non-VAPID empty push also sets Content-Length: 0.
+        let empty_req = try_build_request::<Vec<u8>>(WebPushMessageBuilder::new(&info).build().unwrap()).unwrap();
+        assert_eq!(empty_req.headers().get(CONTENT_LENGTH).unwrap(), "0");
+        assert!(empty_req.body().is_empty());
+    }
+
+    #[test]
+    fn try_build_request_rejects_invalid_header_values_without_panicking() {
+        let msg = WebPushMessage {
+            endpoint: "https://updates.push.services.mozilla.com/wpush/v2/token"
+                .parse()
+                .unwrap(),
+            ttl: 60,
+            urgency: None,
+            topic: Some("bad\r\ntopic".into()),
+            payload: None,
+        };
+        assert!(try_build_request::<Vec<u8>>(msg).is_err());
     }
 
     #[test]
@@ -206,6 +296,14 @@ mod tests {
         assert!(matches!(
             parse_response(StatusCode::INTERNAL_SERVER_ERROR, vec![]),
             Err(WebPushError::ServerError { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_a_too_many_requests_response_as_server_error() {
+        assert!(matches!(
+            parse_response(StatusCode::TOO_MANY_REQUESTS, vec![]),
+            Err(WebPushError::ServerError { retry_after: None, .. })
         ));
     }
 
