@@ -6,8 +6,8 @@
 ![Apache-2.0 licensed][license-image]
 ![MSRV][msrv-image]
 
-[gh-image]: https://github.com/sadco-io/sad-web-push/actions/workflows/test.yml/badge.svg?branch=0.11.x
-[gh-checks]: https://github.com/sadco-io/sad-web-push/actions/workflows/test.yml?query=branch%3A0.11.x
+[gh-image]: https://github.com/sadco-io/sad-web-push/actions/workflows/test.yml/badge.svg?branch=main
+[gh-checks]: https://github.com/sadco-io/sad-web-push/actions/workflows/test.yml?query=branch%3Amain
 [cratesio-image]: https://img.shields.io/crates/v/sad-web-push.svg
 [cratesio]: https://crates.io/crates/sad-web-push
 [docsrs-image]: https://docs.rs/sad-web-push/badge.svg
@@ -16,43 +16,37 @@
 [msrv-image]: https://img.shields.io/badge/rustc-1.89+-blue.svg
 
 Web push notification client with **pure-Rust HTTP-ECE encryption** (RFC 8188 / RFC 8291 `aes128gcm`
-and legacy `aesgcm`) and **pure-Rust ES256 VAPID authentication**: a **maintained, API-compatible
-fork of [pimeys/rust-web-push][upstream]** carrying security, cryptographic, protocol, and transport
-hardening fixes.
+and legacy `aesgcm`), **pure-Rust ES256 VAPID authentication**, **`hyper 1.x` + `hyper-rustls`
+default transport**, **connect-time IP pinning on Hyper transports**, and **W3C Push API draft
+Declarative Web Push** serialization support: a **maintained fork of
+[pimeys/rust-web-push][upstream]**.
 
-This release replaces the upstream `ece` (`MPL-2.0` / OpenSSL), `jwt-simple` (which pulled in
+This fork replaces the upstream `ece` (`MPL-2.0` / OpenSSL), `jwt-simple` (which pulled in
 `crypto-bigint 0.5.5`, referenced by `RUSTSEC-2026-0387`), `sec1_decode`, `pem`, and `chrono`
-(referenced by informational `RUSTSEC-2026-0543`) dependencies while retaining the `http 0.2` API
-and Cargo dependency-renaming compatibility with `web-push 0.11.0`.
+(referenced by informational `RUSTSEC-2026-0543`) dependencies, with no OpenSSL or libcurl library
+dependency in the default `0.12` feature configuration.
 
 ## Which version?
 
-* **`0.12.x`** *(recommended — receives all fixes)*: modernized release line targeting `http 1.x`,
-  modern HTTP clients with pure-Rust TLS default (`hyper-rustls`), connect-time IP pinning on Hyper
-  transports, and Declarative Web Push serialization support.
+* **`0.12.x`** *(recommended — receives all fixes)*: modernized release line using `http 1.x`,
+  `HyperWebPushClient` (`hyper 1.x` + `hyper-rustls` + `ring` + OS native root certificates) by
+  default with no OpenSSL or libcurl library dependency, connect-time IP pinning on Hyper
+  transports, `WebPushError::{TooManyRequests, Timeout}`, RFC 8291 3,993-byte `aes128gcm`
+  plaintext payloads, and Declarative Web Push (`Notification`). MSRV `1.89.0`.
 * **`0.11.x`** *(security fixes only)*: maintenance line retaining the `http 0.2` API
-  (`isahc-client` default, `hyper-client` optional), MSRV `1.89.0`. Use `0.11.1` or later on this
-  line if you need `http 0.2`.
+  (`isahc-client` default, `hyper-client` optional) with Cargo dependency-renaming support for
+  existing `web_push` imports, MSRV `1.89.0`. Use `0.11.1` or later on this line if you need
+  `http 0.2`.
 
 ## Usage
 
-### Renamed usage (for migrating existing `web-push 0.11` code)
-
-Switch existing `web-push 0.11` code without changing `use web_push::...` imports (note the
-behavior, endpoint policy, timeout, payload limit, and MSRV changes listed below):
-
 ```toml
 [dependencies]
-web-push = { package = "sad-web-push", version = "0.11" }
-```
-
-### Direct usage
-
-```toml
-[dependencies]
-sad-web-push = "0.11"
+sad-web-push = "0.12"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
+
+### Sending a push notification (default `HyperWebPushClient`)
 
 ```rust,no_run
 use std::fs::File;
@@ -71,77 +65,153 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     let file = File::open("private_key.pem")?;
     let sig_builder = VapidSignatureBuilder::from_pem(file, &subscription_info)?.build()?;
 
-    // Add payload and encrypt in pure Rust.
+    // Add payload and encrypt in pure Rust (up to 3,993 plaintext bytes for Aes128Gcm).
     let mut builder = WebPushMessageBuilder::new(&subscription_info);
     let content = "Encrypted payload to be sent in the notification".as_bytes();
     builder.set_payload(ContentEncoding::Aes128Gcm, content);
     builder.set_vapid_signature(sig_builder);
 
-    let client = IsahcWebPushClient::new()?;
+    // hyper 1.x + hyper-rustls client with connect-time IP pinning & 30s/10s default timeouts.
+    let client = HyperWebPushClient::new()?;
     client.send(builder.build()?).await?;
     Ok(())
 }
 ```
 
-### Pure-Rust core (no OpenSSL / no C dependencies)
+### Declarative Web Push (`Notification`)
 
-When building with `--no-default-features`, `sad-web-push` compiles in pure Rust with zero OpenSSL
-or libcurl dependencies. You can pair `request_builder::try_build_request` and
-`request_builder::parse_response` with any HTTP client.
+`Notification::to_payload` serializes a declarative push message in the W3C Push API draft format
+(`{"web_push": 8030, "notification": ...}`), accepting caller-supplied field values without
+browser-specific validation. For a subscription created with an `applicationServerKey`, attach a
+VAPID signature made with the corresponding private key before sending:
+
+```rust,no_run
+use std::fs::File;
+use sad_web_push::{
+    ContentEncoding, HyperWebPushClient, Notification, NotificationAction, SubscriptionInfo,
+    VapidSignatureBuilder, WebPushClient, WebPushMessageBuilder,
+};
+
+# async fn send_declarative(sub: SubscriptionInfo) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+let mut notification: Notification<()> = Notification::new(
+    "New message".to_string(),
+    "https://example.com/inbox".to_string(),
+);
+notification.body = Some("You have an unread message.".to_string());
+notification.actions = Some(vec![NotificationAction {
+    title: "Open".to_string(),
+    action: "open".to_string(),
+    navigate: "https://example.com/inbox".to_string(),
+    icon: None,
+}]);
+
+let file = File::open("private_key.pem")?;
+let signature = VapidSignatureBuilder::from_pem(file, &sub)?.build()?;
+
+let payload = notification.to_payload()?;
+let mut builder = WebPushMessageBuilder::new(&sub);
+builder.set_payload(ContentEncoding::Aes128Gcm, &payload);
+builder.set_vapid_signature(signature);
+
+let client = HyperWebPushClient::new()?;
+client.send(builder.build()?).await?;
+# Ok(())
+# }
+```
+
+### Endpoint Policy, Timeouts & Local Testing
+
+By default, `HyperWebPushClient` and `HyperNativeTlsWebPushClient`:
+- require canonical `https` and a nonempty host, reject embedded userinfo and malformed or zero
+  explicit ports, accept valid non-default ports, and block localhost names, non-canonical numeric
+  IPv4 forms, and disallowed special-use IPv4/IPv6 ranges (restricting IPv6 literals to `2000::/3`
+  global unicast minus selected special-purpose and transition ranges, applying IPv4 rules to
+  IPv4-mapped IPv6 and the well-known NAT64 prefix, and rejecting scoped IPv6 literals and
+  local-use NAT64),
+- validate the URL at send time, check every DNS-resolved address against the configured IP policy
+  on each new connection, and dial only those checked socket addresses directly while preserving
+  URI-host TLS certificate verification and DNS-name SNI (mitigating DNS rebinding between
+  validation and connection; see [SECURITY.md](SECURITY.md) for pooled connection reuse and
+  deployment egress controls),
+- disable HTTP redirects,
+- configure a 10-second DNS/TCP connect deadline and a 30-second overall request deadline (both
+  returning `WebPushError::Timeout`), and
+- enforce a `65,536`-byte maximum response body size (`WebPushError::ResponseTooLarge`).
+
+Customize timeouts or opt into `http://` / loopback endpoints for local test harnesses via the
+client builder. When targeting a local mock server with builder-produced messages, also set
+`.allow_insecure_endpoint(true)` on `WebPushMessageBuilder` (and `VapidSignatureBuilder` if using
+VAPID):
+
+```rust,no_run
+use std::time::Duration;
+use sad_web_push::HyperWebPushClient;
+
+# fn configure() -> Result<(), sad_web_push::WebPushError> {
+// Production custom timeouts (endpoint and IP policy stays enabled):
+let prod_client = HyperWebPushClient::builder()
+    .timeout(Duration::from_secs(15))
+    .connect_timeout(Duration::from_secs(5))
+    .build()?;
+
+// Local integration tests against a loopback mock server
+// (also call `.allow_insecure_endpoint(true)` on WebPushMessageBuilder / VapidSignatureBuilder):
+let test_client = HyperWebPushClient::builder()
+    .timeout(Duration::from_secs(5))
+    .allow_insecure_endpoints(true)
+    .build()?;
+# let _ = (prod_client, test_client);
+# Ok(())
+# }
+```
+
+### Pure-Rust core without built-in HTTP clients
+
+Disable default features to compile only the pure-Rust RFC 8291 / VAPID / `Notification` core with
+`request_builder::{try_build_request, parse_response, parse_retry_after}` (`http 1.x`):
 
 ```toml
 [dependencies]
-sad-web-push = { version = "0.11", default-features = false }
+sad-web-push = { version = "0.12", default-features = false }
 ```
 
-## Compatibility & Differences from `web-push 0.11.0`
+## Migrating from `0.11.x` (or `web-push 0.11.0`) to `0.12.0`
 
-`sad-web-push 0.11.1` retains the `http 0.2` API and supports Cargo dependency renaming for
-existing `web_push` imports (API compatibility verified with `cargo-semver-checks`), while making
-deliberate security and correctness changes to endpoint policy, timeouts, payload limits, and MSRV:
+If you need to stay on `http 0.2`, use `sad-web-push = "0.11"` (renamed alias:
+`web-push = { package = "sad-web-push", version = "0.11" }`; receives security fixes only). To
+adopt `0.12.0`:
 
-* **Default builder endpoint policy:** `WebPushMessageBuilder::build()` and
-  `VapidSignatureBuilder::build()` require canonical `https` and a nonempty host, reject embedded
-  userinfo and malformed or zero explicit ports, accept valid non-default ports, and block
-  localhost names, non-canonical numeric IPv4 forms, and disallowed special-use IPv4/IPv6 ranges
-  (restricting IPv6 literals to `2000::/3` global unicast minus selected special-purpose and transition
-  ranges, applying IPv4 rules to IPv4-mapped IPv6 and the well-known NAT64 prefix, and rejecting
-  scoped IPv6 literals and local-use NAT64). For local testing or mock servers, call
-  `.allow_insecure_endpoint(true)` on either builder. On `0.11.x`, built-in clients do not repeat
-  this check in `send` and do not filter post-DNS IP addresses; see [SECURITY.md](SECURITY.md).
-* **Default HTTP timeouts & redirect protection:** `IsahcWebPushClient::new()` and
-  `HyperWebPushClient::new()` configure a 30-second overall request deadline and 10-second connect
-  timeout (`with_timeout(d)` sets connect timeout to `min(10s, d)`). `HyperWebPushClient::from`
-  adds the 30-second request deadline and keeps the supplied connector configuration;
-  `IsahcWebPushClient::from` keeps the supplied client configuration while `send` enforces
-  `RedirectPolicy::None` per request.
-* **Consistent payload size limit:** Maximum unencrypted payload size is consistently enforced and
-  documented as `3,800` bytes across `aes128gcm` and `aesgcm`. Legacy `aesgcm` rejects 0-byte
-  plaintext (`InvalidCryptoKeys`) for compatibility with `ece`/Firefox.
-* **VAPID headers on empty-payload pushes:** `WebPushMessageBuilder::build()` preserves the
-  `Authorization: vapid ...` header even when no payload is attached, and `try_build_request` sets
-  `Content-Length: 0` on all empty-body pushes.
-* **HTTP 429 `Retry-After`:** `429 Too Many Requests` responses map to `WebPushError::ServerError`
-  with the parsed `Retry-After` duration attached (capped at `31,536,000` seconds).
-* **Additive public APIs:** Re-exported `ErrorInfo` at the crate root; added
-  `request_builder::try_build_request`, `request_builder::parse_retry_after`,
-  `allow_insecure_endpoint(bool)`, and client `with_timeout(Duration)`.
-* **MSRV:** Rust `1.89.0` (driven by `aes 0.9.4`; `sha2 0.11.1` requires Rust `1.88`).
+1. **HTTP types upgraded to `http 1.x`:** Update any direct `http` imports used with
+   `WebPushMessage::endpoint` or `request_builder` from `http 0.2` to `http 1`.
+2. **Default client switched to `HyperWebPushClient`:** `default = ["hyper-client"]` uses
+   `hyper 1.x` + `hyper-rustls` (Tokio). If you need an executor-agnostic client, enable
+   `default-features = false, features = ["isahc-client"]`; if you need platform native TLS on
+   `hyper 1.x`, enable `default-features = false, features = ["hyper-native-tls"]`.
+3. **Fallible `HyperWebPushClient::new()`:** Handle the `Result<HyperWebPushClient, WebPushError>`
+   returned by `HyperWebPushClient::new()?` and `HyperWebPushClient::with_timeout(d)?`.
+4. **Distinct `429` and timeout errors:** Match `WebPushError::TooManyRequests { retry_after, info }`
+   for HTTP 429 rate limits and `WebPushError::Timeout` for configured Hyper connect/request
+   deadlines and mapped Isahc request/body-read timeout errors.
+5. **Empty-payload VAPID field:** `WebPushMessage` now has `pub vapid_signature: Option<VapidSignature>`.
+   Empty-payload pushes keep `payload: None` while storing the VAPID signature in `vapid_signature`.
+   If you construct `WebPushMessage` literals manually, initialize `vapid_signature: None` (or
+   `Some(sig)`).
 
-## Security & Hardening Summary
+## Crate Features
 
-| Area | Upstream `web-push 0.11.0` | `sad-web-push 0.11.1` |
-|---|---|---|
-| Cryptography & Dependencies | `ece` (`MPL-2.0`, OpenSSL), `jwt-simple` (`RUSTSEC-2026-0387`), `sec1_decode`, `pem` | Pure-Rust `p256 0.14`, `aes-gcm 0.11`, `hkdf 0.13`, `sha2 0.11`, `pem-rfc7468 1.0`, `zeroize 1.8` |
-| `Retry-After` Parsing | `chrono` (`RUSTSEC-2026-0543`), RFC 2822 only | Zero-dep `httpdate 1.0`, numeric seconds + RFC 7231 HTTP-dates capped at `31,536,000` seconds |
-| Base64 VAPID Key Panic | Panics on non-32-byte keys (`rust-web-push#73`) | Pre-decode length check (43 chars / 32 bytes) returning `Err(WebPushError::InvalidCryptoKeys)` |
-| Endpoint Validation & Request Building | Accepts `http://`, private/special-use IPs; unwraps URI parts | Builder HTTPS + IP/hostname/port policy (opt-in `allow_insecure_endpoint(true)`); fallible `try_build_request` (`build_request` remains panicking for compatibility) |
-| Key & Response Bounds | Unbounded key reads; Hyper extended body before cap check | `65,536`-byte cap on PEM/DER reads; `65,536`-byte response cap (Hyper pre-append check; Isahc reads up to `65,537` bytes) |
-| Secret Handling | Logged raw `Authorization` header at `DEBUG`; no zeroization | Redacted `Debug` for `VapidSignature`, `SubscriptionKeys`, `SubscriptionInfo`, `WebPushPayload`, and `WebPushMessage`; sensitive `Authorization` header; metadata-only built-in logs (host/TTL/status); `Zeroizing` library-owned buffers |
-| Timeouts & Redirects | No timeouts | 30s request / 10s connect defaults + `with_timeout(Duration)`; redirects disabled |
-
-See [SECURITY.md](SECURITY.md) for the full threat model, zeroization/redaction scope, `0.11.x`
-SSRF residual risks, and vulnerability disclosure instructions.
+* `default`: Enables `hyper-client`.
+* `hyper-client`: Async client (`HyperWebPushClient`) built on `hyper 1.x` + `hyper-rustls 0.27`
+  using an explicit `ring` provider and OS native root loading (`rustls-native-certs`; Unix root
+  discovery may use `openssl-probe` and honor `SSL_CERT_FILE`/`SSL_CERT_DIR`) with connect-time IP
+  pinning (`SafeHttpConnector`). No OpenSSL or libcurl library dependency in this default
+  configuration. Requires Tokio.
+* `hyper-native-tls`: Async client (`HyperNativeTlsWebPushClient`) built on `hyper 1.x` +
+  `hyper-tls 0.6` (`native-tls`: Secure Transport on macOS, SChannel on Windows, OpenSSL on other
+  supported targets) with connect-time IP pinning (`SafeHttpConnector`). Requires Tokio.
+* `isahc-client`: Executor-agnostic async client (`IsahcWebPushClient`) built on `isahc 2.x`
+  (libcurl with `static-curl` enabled by default and a build-dependent TLS backend). Enforces
+  send-time URL validation and per-request `RedirectPolicy::None`, but delegates DNS and proxy
+  handling to Isahc; see [SECURITY.md](SECURITY.md) for residual risk notes.
 
 ## VAPID Keys
 
@@ -176,21 +246,13 @@ Store a browser `PushSubscription` JSON object in `test.json` and run:
 cd examples/simple-send && cargo run -- -v ../../private_key.pem -f ../../test.json -p "It works!"
 ```
 
-## Crate Features
-
-* `default`: Enables `isahc-client`.
-* `isahc-client`: Async client built on `isahc` (executor-agnostic; uses libcurl with `static-curl`
-  enabled by default and a build-dependent TLS backend).
-* `hyper-client`: Async client built on `hyper 0.14` + `hyper-tls` (Tokio-only; uses platform
-  `native-tls`).
-
 ## License & Attribution
 
 `sad-web-push` is licensed under the [Apache License, Version 2.0](LICENSE).
 
 See [NOTICE](NOTICE) for upstream copyright attribution (`Copyright 2017 Julius de Bruijn`, with
 additional contributors at [pimeys/rust-web-push][upstream]) and a summary of modifications,
-[CHANGELOG.md](CHANGELOG.md) for release notes, and [SECURITY.md](SECURITY.md) to report a
-vulnerability.
+[CHANGELOG.md](CHANGELOG.md) for release notes, and [SECURITY.md](SECURITY.md) for our threat model,
+zeroization/redaction scope, transport security boundaries, and vulnerability disclosure process.
 
 [upstream]: https://github.com/pimeys/rust-web-push

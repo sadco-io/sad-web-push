@@ -21,15 +21,18 @@ application configuration:
   (returning `InvalidCryptoKeys` on overflow and `MissingCryptoKeys` if a PEM has no recognized
   private-key block). Raw base64url keys are length-checked (43 characters / 32 bytes) before
   decoding into a fixed-size zeroizing buffer, returning `InvalidCryptoKeys` on invalid input.
-- **Payload encryption & JWT signing:** Pure-Rust RFC 8188 / RFC 8291 (`aes128gcm`), legacy
-  draft-04 (`aesgcm`), and ES256 VAPID JWT signing. Custom VAPID `aud` and `sub` overrides are
-  checked for JSON string type and `exp` for unsigned integer type; callers supplying overrides are
-  responsible for RFC 8292 claim values and expiry windows.
+- **Payload encryption, declarative payloads & JWT signing:** Pure-Rust RFC 8188 / RFC 8291
+  (`aes128gcm`), legacy draft-04 (`aesgcm`), W3C Push API draft `Notification` JSON serialization,
+  and ES256 VAPID JWT signing. Custom VAPID `aud` and `sub` overrides are checked for JSON string
+  type and `exp` for unsigned integer type; callers supplying overrides are responsible for RFC 8292
+  claim values and expiry windows.
 - **Untrusted push service responses:** HTTP status handling, `Retry-After` parsing (capped at
   31,536,000 seconds / 365 days), JSON `ErrorInfo` parsing, and a 65,536-byte response body cap
   (`ResponseTooLarge` on overflow; Hyper checks before appending each received chunk, while Isahc
   reads up to 65,537 bytes to detect overflow; the public `parse_response` helper accepts an already
   allocated body without an independent size cap).
+- **Outbound push connections:** Endpoint validation and connect-time IP pinning in the built-in
+  `hyper 1.x` transports.
 
 Panics, unbounded memory/CPU consumption, cryptographic weaknesses, secret disclosure in logs or
 `Debug` output, or validation bypasses reachable from these inputs are in scope.
@@ -49,12 +52,12 @@ marks `Authorization` header values as sensitive, and built-in client logs recor
 and HTTP status. Callers should still treat subscription URLs, response error details (`ErrorInfo`),
 and transport wire traces as sensitive.
 
-### Endpoint Policy & SSRF Residual Risks on `0.11.x`
+### Endpoint Policy, Connect-Time IP Pinning & Residual Risks
 
-By default, `WebPushMessageBuilder::build()` and `VapidSignatureBuilder::build()` require canonical
-`https` and a nonempty host, reject embedded userinfo and malformed or zero explicit ports, accept
-valid non-default ports, and block localhost names, non-canonical numeric IPv4 forms, and
-disallowed IP ranges:
+By default, `WebPushMessageBuilder::build()`, `VapidSignatureBuilder::build()`, and all built-in
+clients require canonical `https` and a nonempty host, reject embedded userinfo and malformed or
+zero explicit ports, accept valid non-default ports, and block localhost names, non-canonical
+numeric IPv4 forms, and disallowed IP ranges:
 
 - **IPv4:** unspecified / "this network", RFC 1918 private, loopback, link-local, CGNAT,
   documentation, IETF protocol assignments, deprecated 6to4 relay anycast, benchmarking, multicast,
@@ -64,25 +67,32 @@ disallowed IP ranges:
   IPv4 rules are applied to IPv4-mapped IPv6 and the well-known NAT64 prefix; scoped IPv6 literals
   and the local-use NAT64 prefix are rejected.
 
-Explicitly opting out via `allow_insecure_endpoint(true)` permits canonical `http` and skips the
-host/IP policy while retaining nonempty-host, valid-port, and no-userinfo requirements.
+Explicitly opting out (`allow_insecure_endpoint(true)` on builders and
+`allow_insecure_endpoints(true)` on clients) permits canonical `http` and skips the host/IP policy
+while retaining nonempty-host, valid-port, and no-userinfo requirements.
 
-On the `0.11.x` release line:
+Transport-specific boundaries and residual risks:
 
-- Endpoint validation runs in the message and VAPID builders. `IsahcWebPushClient` and
-  `HyperWebPushClient` do **not** repeat this policy inside `send`, so applications that
-  hand-construct or modify a `WebPushMessage` directly must enforce endpoint validation before
-  sending.
-- Neither client checks the IP address selected after DNS resolution. A DNS name that resolves to
-  an internal/private IP address or performs DNS rebinding is not blocked by `sad-web-push 0.11.x`
-  alone.
-- Default clients do not follow HTTP redirects, and `IsahcWebPushClient::send` enforces
-  `RedirectPolicy::None` per request (including when wrapping a custom `isahc::HttpClient`). Custom
-  clients supplied via `From` keep their configured proxy, TLS, and (for Isahc) timeout settings.
-
-Applications sending to untrusted subscription URLs on `0.11.x` should pair the crate with an
-approved push-service allowlist and egress controls at the network boundary, or upgrade to `0.12.x`
-for connect-time IP pinning on Hyper transports.
+- **`HyperWebPushClient` (default `hyper-client`) and `HyperNativeTlsWebPushClient`
+  (`hyper-native-tls`):** Validate the endpoint URL at send time (including hand-constructed
+  `WebPushMessage` values). On each new connection they check every returned DNS address against the
+  configured IP policy (rejecting mixed results containing any denied address with
+  `WebPushError::InvalidUri`) and dial only those checked socket addresses directly, mitigating DNS
+  rebinding between validation and connection. HTTPS still verifies the original endpoint host and
+  uses DNS-name SNI where applicable. An established pooled connection can be reused without another
+  DNS lookup. Default clients do not follow HTTP redirects. These checks do not establish that a
+  destination is external to the deployment's network; locally routed addresses and translation
+  infrastructure require separate egress controls.
+- **`IsahcWebPushClient` (`isahc-client`):** Validates the initial URL at send time and enforces
+  `RedirectPolicy::None` per request (including when wrapping a custom `isahc::HttpClient` via
+  `From`), but delegates DNS resolution, proxy behavior, and TLS to Isahc. A private destination
+  reached through DNS or a configured proxy is outside that initial validation, and custom clients
+  supplied via `From` keep their configured proxy, TLS, and timeout settings.
+- **Custom `request_builder` callers and `0.11.x`:** The public `request_builder` helpers leave
+  endpoint and transport policy to the caller. On `0.11.x`, built-in clients do not repeat builder
+  validation in `send` and do not filter post-DNS IPs. Deployments using `IsahcWebPushClient`,
+  custom `request_builder` callers, or `0.11.x` with untrusted subscription URLs should pair the
+  crate with an approved push-service allowlist and egress controls at the network boundary.
 
 ## Advisories
 
