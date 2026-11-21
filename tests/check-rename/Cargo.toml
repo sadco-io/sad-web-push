@@ -1,0 +1,11 @@
+[package]
+name = "check-rename"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+http = "1"
+web-push = { package = "sad-web-push", path = "../..", features = ["hyper-client", "hyper-native-tls", "isahc-client"] }
+
+[workspace]

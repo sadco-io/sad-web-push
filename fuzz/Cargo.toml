@@ -1,0 +1,56 @@
+[package]
+name = "sad-web-push-fuzz"
+version = "0.0.0"
+authors = ["Sadco Security Team"]
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+http = "1"
+libfuzzer-sys = "0.4"
+serde_json = "1"
+
+[dependencies.sad-web-push]
+path = ".."
+default-features = false
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_vapid_pem"
+path = "fuzz_targets/fuzz_vapid_pem.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_vapid_der"
+path = "fuzz_targets/fuzz_vapid_der.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_vapid_base64"
+path = "fuzz_targets/fuzz_vapid_base64.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_subscription_build"
+path = "fuzz_targets/fuzz_subscription_build.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_parse_response"
+path = "fuzz_targets/fuzz_parse_response.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_retry_after"
+path = "fuzz_targets/fuzz_retry_after.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_notification"
+path = "fuzz_targets/fuzz_notification.rs"
+doc = false

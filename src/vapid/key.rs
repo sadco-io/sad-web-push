@@ -1,22 +1,17 @@
-use jwt_simple::prelude::*;
+use p256::ecdsa::SigningKey;
 
-/// The P256 curve key pair used for VAPID ECDHSA.
-pub struct VapidKey(pub ES256KeyPair);
-
-impl Clone for VapidKey {
-    fn clone(&self) -> Self {
-        VapidKey(ES256KeyPair::from_bytes(&self.0.to_bytes()).unwrap())
-    }
-}
+/// The P-256 curve key pair used for VAPID ES256 signing.
+#[derive(Clone)]
+pub struct VapidKey(pub(crate) SigningKey);
 
 impl VapidKey {
-    pub fn new(ec_key: ES256KeyPair) -> VapidKey {
+    pub fn new(ec_key: SigningKey) -> VapidKey {
         VapidKey(ec_key)
     }
 
-    /// Gets the uncompressed public key bytes derived from this private key.
+    /// Gets the 65-byte uncompressed SEC1 public key bytes derived from this private key.
     pub fn public_key(&self) -> Vec<u8> {
-        self.0.public_key().public_key().to_bytes_uncompressed()
+        self.0.verifying_key().to_sec1_point(false).as_bytes().to_vec()
     }
 }
 
@@ -52,6 +47,7 @@ mod tests {
 
         let key2 = key.clone();
 
-        assert_eq!(key.0.to_bytes(), key2.0.to_bytes())
+        assert_eq!(key.public_key(), key2.public_key());
+        assert_eq!(key.0.to_bytes(), key2.0.to_bytes());
     }
 }

@@ -42,18 +42,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         ap.parse_args_or_exit();
     }
 
-    let mut file = File::open(subscription_info_file).unwrap();
+    let mut file = File::open(subscription_info_file)?;
     let mut contents = String::new();
-    file.read_to_string(&mut contents).unwrap();
+    file.read_to_string(&mut contents)?;
 
     let ece_scheme = match encoding.as_deref() {
-        Some("aes128gcm") => ContentEncoding::Aes128Gcm,
+        Some("aes128gcm") | None => ContentEncoding::Aes128Gcm,
         Some("aesgcm") => ContentEncoding::AesGcm,
-        None => ContentEncoding::Aes128Gcm,
         Some(_) => panic!("Content encoding can only be 'aes128gcm' or 'aesgcm'"),
     };
 
-    let subscription_info: SubscriptionInfo = serde_json::from_str(&contents).unwrap();
+    let subscription_info: SubscriptionInfo = serde_json::from_str(&contents)?;
 
     let mut builder = WebPushMessageBuilder::new(&subscription_info);
 
@@ -68,25 +67,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     }
 
     if let Some(ref vapid_file) = vapid_private_key {
-        let file = File::open(vapid_file).unwrap();
+        let file = File::open(vapid_file)?;
 
-        let mut sig_builder = VapidSignatureBuilder::from_pem(file, &subscription_info).unwrap();
+        let mut sig_builder = VapidSignatureBuilder::from_pem(file, &subscription_info)?;
 
         sig_builder.add_claim("sub", "mailto:test@example.com");
         sig_builder.add_claim("foo", "bar");
         sig_builder.add_claim("omg", 123);
 
-        let signature = sig_builder.build().unwrap();
+        let signature = sig_builder.build()?;
 
         builder.set_vapid_signature(signature);
     };
 
-    let client = IsahcWebPushClient::new()?;
+    let client = HyperWebPushClient::new()?;
 
     let result = client.send(builder.build()?).await;
 
     if let Err(error) = result {
-        println!("An error occured: {:?}", error);
+        println!("An error occurred: {:?}", error);
     }
 
     Ok(())
