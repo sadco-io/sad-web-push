@@ -1,0 +1,65 @@
+sad-web-push
+Copyright 2026 Sadco Security Team
+
+This project is a maintained fork of the web-push crate. The 0.11.x maintenance
+line retains the web-push 0.11 http 0.2 API while carrying pure-Rust
+cryptography, security, protocol, and robustness fixes.
+
+Original web-push Crate
+=======================
+Copyright 2017 Julius de Bruijn
+
+Additional contributions by contributors to the pimeys/rust-web-push project.
+
+The original web-push crate was developed at:
+https://github.com/pimeys/rust-web-push
+
+web-push is licensed under the Apache License, Version 2.0. sad-web-push is
+distributed under the same terms; see LICENSE for the full license text.
+
+Modifications
+=============
+This fork includes the following changes relative to web-push 0.11.0
+(commit 8de73e2e):
+
+- Cherry-picked unreleased upstream documentation improvements for
+  WebPushMessageBuilder (commit d4d339b4 by Niklas Fiekas, rust-web-push#77).
+- Replaced Mozilla's MPL-2.0 / OpenSSL-backed `ece` crate, `jwt-simple`
+  (which pulled in `crypto-bigint 0.5.5`, referenced by RUSTSEC-2026-0387),
+  `sec1_decode`, `pem`, and `chrono` (referenced by informational
+  RUSTSEC-2026-0543) with pure-Rust implementations built on `p256 0.14`,
+  `aes-gcm 0.11`, `hkdf 0.13`, `sha2 0.11`, `pem-rfc7468 1.0`, `getrandom 0.4`,
+  `zeroize 1.8`, and `httpdate 1.0`. Enabled Serde's `derive` feature in place
+  of a direct `serde_derive` dependency.
+- Implemented RFC 8188 / RFC 8291 (`aes128gcm`) and legacy
+  draft-ietf-webpush-encryption-04 (`aesgcm`) payload encryption in pure Rust,
+  clearing selected library-owned secret buffers (ephemeral keys, ECDH secrets,
+  IKM, CEK, nonce, and plaintext records) on drop.
+- Implemented pure-Rust ES256 VAPID JWT signing and bounded (65,536-byte) SEC1
+  / PKCS#8 PEM, DER, and fixed-size raw base64url key parsing, fixing the panic
+  on wrong-length base64 private keys (rust-web-push#73,
+  https://github.com/pimeys/rust-web-push/issues/73, reported by a-kolechko).
+- Hardened builder endpoint validation (default canonical HTTPS with nonempty
+  host, no embedded userinfo, valid non-zero explicit ports, and rejection of
+  localhost names, non-canonical numeric IPv4 forms, and disallowed special-use
+  IPv4/IPv6 ranges including restricting IPv6 literals to 2000::/3 global
+  unicast minus selected special-purpose and transition ranges, with opt-in
+  `allow_insecure_endpoint(true)` for local testing), added fallible
+  `request_builder::try_build_request` and `request_builder::parse_retry_after`
+  (capped at 31,536,000 seconds), added `Debug` redaction for secrets and
+  endpoint paths, marked `Authorization` headers sensitive, removed endpoint
+  paths and headers from built-in client logs, enforced a 65,536-byte response
+  body cap (Hyper checks before appending each chunk; Isahc reads up to 65,537
+  bytes to detect overflow), added default HTTP timeouts (30s request / 10s
+  connect) and `with_timeout` constructors, enforced per-request
+  `RedirectPolicy::None` on `IsahcWebPushClient`, preserved VAPID headers on
+  empty-payload pushes, attached `Retry-After` on HTTP 429 responses,
+  reconciled the 3,800-byte payload size limit, re-exported `ErrorInfo` at the
+  crate root, and declared MSRV Rust 1.89.0.
+- The crate is published as `sad-web-push` (library `sad_web_push`).
+
+The upstream changes listed above were written by their upstream authors; see
+CHANGELOG.md for attribution of each change. The packaging changes, pure-Rust
+cryptographic implementation, and Sadco Security Team fixes listed above were
+developed by the Sadco Security Team with assistance from AI coding tools
+(Anthropic Claude, Google Gemini).
